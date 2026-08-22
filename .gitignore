@@ -1,0 +1,47 @@
+# Build output
+dist/
+dist-electron/
+release/
+coverage/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.mypy_cache/
+
+# Bundled helper binaries.
+#
+# ffmpeg and yt-dlp are fetched by scripts/fetch-binaries.mjs rather than
+# committed: they are large, platform-specific, and licensed separately.
+# See NOTICE.md.
+bin/
+
+# Local runtime and workspace data (these live in app-data at runtime, but
+# a dev run with a custom path can put them here)
+runtime/
+workspace/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and env
+*.log
+npm-debug.log*
+.env
+.env.local

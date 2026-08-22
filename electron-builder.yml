@@ -1,0 +1,73 @@
+appId: com.sipra.app
+productName: Sipra
+copyright: Sipra contributors
+
+directories:
+  output: release
+  buildResources: build
+
+# Everything the app needs at runtime. The Python core ships as plain
+# source rather than inside the asar, because the sidecar is a separate
+# process that has to import it from the filesystem.
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - '!**/__pycache__/**'
+  - '!**/*.map'
+
+extraResources:
+  - from: python
+    to: python
+    filter:
+      - '**/*'
+      - '!__pycache__/**'
+      - '!**/*.pyc'
+      - '!tests/**'
+      - '!.pytest_cache/**'
+  - from: build
+    to: build
+    filter:
+      - icon.png
+      - icon.ico
+  # Bundled helper binaries: ffmpeg, and yt-dlp when the build includes it.
+  # See NOTICE.md before shipping a build with yt-dlp in here.
+  - from: bin
+    to: bin
+    filter:
+      - '**/*'
+
+asar: true
+# The runtime is built into the user's app-data folder on first launch, so
+# nothing here needs unpacking.
+asarUnpack: []
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  artifactName: Sipra-${version}-Setup-${arch}.${ext}
+  # Unsigned builds trigger SmartScreen on first run. Signing needs a
+  # certificate; see docs/BUILDING.md.
+  signAndEditExecutable: true
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Sipra
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  deleteAppDataOnUninstall: false
+  artifactName: Sipra-${version}-Setup-${arch}.${ext}
+
+# Sipra has no update server. Builds are downloaded from GitHub Releases.
+publish: null
+
+compression: maximum
+removePackageScripts: true

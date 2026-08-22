@@ -1,0 +1,15 @@
+# Separation engine, CUDA build.
+#
+# Installed only when `nvidia-smi` reported a GPU. These wheels are around
+# 2.5 GB; on a machine with no NVIDIA card they would be a large download
+# for no benefit, which is why the probe runs first.
+#
+# cu121 is chosen over newer toolkits because it works with the widest
+# range of installed drivers. A user with a very new card can switch to a
+# newer index here without touching anything else.
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.1,<3
+torchaudio>=2.1,<3
+demucs>=4.0.1,<5

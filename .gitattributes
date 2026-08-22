@@ -1,0 +1,19 @@
+# Normalize line endings to LF in the repo; let git handle checkout conversion.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF so PowerShell / Inno Setup are happy.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.iss text eol=crlf
+
+# Treat these as binary (no line-ending conversion, no text diffs).
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.wav binary
+*.flac binary
+*.mp3 binary
+*.th binary

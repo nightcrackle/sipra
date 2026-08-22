@@ -1,0 +1,18 @@
+# Analysis and I/O dependencies for Sipra's audio core.
+#
+# Versions are pinned to a compatible range rather than exact pins: this
+# environment is created fresh on each user's machine, and an exact pin
+# would break the day a transitive dependency drops a wheel for their
+# Python version. The upper bounds are the part that matters — they stop a
+# future major release from silently changing analysis results.
+
+numpy>=1.24,<3
+scipy>=1.10,<2
+soundfile>=0.12,<1
+librosa>=0.10,<0.12
+pyloudnorm>=0.1.1,<0.2
+
+# librosa pulls these in, but naming them keeps the resolver honest about
+# which versions are actually supported.
+numba>=0.58
+soxr>=0.3
