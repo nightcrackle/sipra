@@ -12,6 +12,66 @@ real hardware.
 
 ---
 
+## [0.9.1] — 2026-08-22
+
+Both fixes here came from the first real run on Windows. Neither had test
+coverage, which is why they shipped.
+
+### Fixed
+
+- **A yt-dlp timeout surfaced as "Unexpected failure: Command [...] timed
+  out after 60 seconds".** `subprocess.TimeoutExpired` was never caught in
+  `fetch_metadata`, so it fell through to the generic handler and reached
+  the user as a raw Python string naming no cause and suggesting no
+  remedy. Process-level failures are now converted into explained errors
+  that say what was being attempted and what to try.
+- **The progress bar sat at exactly 80% for the whole stem-writing
+  stage.** 80% is the boundary between `separate` and `write` in the stage
+  weights. The write loop reported only on completion of each stem, so
+  between "separation finished" and "first stem written" — tens of
+  megabytes of clipping, transposing and disk I/O per stem on a real
+  track — nothing was emitted at all. Progress is now reported at the
+  start, middle and end of each stem.
+
+### Changed
+
+- **Stems are released as soon as they reach disk.** The whole set was
+  held in memory for the duration of the write loop, alongside the source
+  and whatever the engine had not yet freed. On a six-stem separation of a
+  long track that is enough to push a modest machine into swap, which is
+  what turns a slow stage into an apparently frozen one.
+- **A link with no video id is now rejected instantly.** `…/watch?v=` with
+  nothing after it — a link truncated on its way through a chat client —
+  was handed to yt-dlp, which sat on it until the timeout fired. Video ids
+  are validated before anything is spawned.
+- **yt-dlp is given `--socket-timeout` and `--retries`.** Without them it
+  waits on a half-open socket until Sipra's own timeout fires, which
+  disguises a routing problem as an unexplained hang.
+- **Timeouts raised, and the startup cost paid separately.** The Windows
+  yt-dlp is a PyInstaller bundle that unpacks ~17 MB into `%TEMP%` on its
+  first run, with antivirus watching. That alone could exceed the old 60 s
+  metadata timeout. A one-off preflight now absorbs it, and the timeouts
+  are overridable via `SIPRA_YTDLP_METADATA_TIMEOUT` and friends.
+- **`Sidecar.configure` merges instead of replacing.** It was called once
+  the Python path was known and silently dropped the `onStderr` handler
+  set up at construction, taking the engine's diagnostics with it.
+
+### Added
+
+- **A downloader check in the import dialog.** Reports whether yt-dlp is
+  present, whether it starts, whether it can reach YouTube, and what to
+  try — because "it timed out" is not something anyone can act on, and
+  those three failures need three different responses.
+- **Stage tracing.** `SIPRA_TRACE_STAGES=1` makes each pipeline stage
+  announce itself on stderr with a timestamp, so a stalled job can be
+  located rather than guessed at. On by default in development.
+- `SIPRA_YTDLP_FORCE_IPV4=1` for machines with a half-configured IPv6
+  stack, a common cause of exactly this class of hang.
+- Regression tests for every path above, including the timeout that
+  started it.
+
+---
+
 ## [0.9.0] — 2026-08-22
 
 First feature-complete build. Everything described in the README works.
@@ -227,6 +287,7 @@ Project started.
 - Demucs is archived upstream. The engine interface exists so a
   replacement can be dropped in without touching the interface.
 
+[0.9.1]: https://github.com/OWNER/sipra/releases/tag/v0.9.1
 [0.9.0]: https://github.com/OWNER/sipra/releases/tag/v0.9.0
 [0.8.0]: https://github.com/OWNER/sipra/releases/tag/v0.8.0
 [0.7.0]: https://github.com/OWNER/sipra/releases/tag/v0.7.0

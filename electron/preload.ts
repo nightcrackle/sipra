@@ -76,6 +76,7 @@ const api: SipraApi = {
 
   youtube: {
     status: () => ipcRenderer.invoke(CHANNELS.youtubeStatus),
+    diagnose: () => ipcRenderer.invoke(CHANNELS.youtubeDiagnose),
     metadata: (url) => ipcRenderer.invoke(CHANNELS.youtubeMetadata, url),
     import: (url, rightsConfirmed, folderId) =>
       ipcRenderer.invoke(CHANNELS.youtubeImport, url, rightsConfirmed, folderId),

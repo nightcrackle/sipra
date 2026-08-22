@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import { formatDuration } from '@shared/format';
+import type { YoutubeDiagnosis } from '@shared/ipc';
 
 import { useStore } from '../state/store';
 import { LinkIcon, PlusIcon, WarningIcon } from './Icons';
@@ -35,6 +36,8 @@ export function ImportDialog(): JSX.Element | null {
   const [downloader, setDownloader] = useState<{ available: boolean; allowedHosts: string[] } | null>(
     null,
   );
+  const [diagnosis, setDiagnosis] = useState<YoutubeDiagnosis | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -63,6 +66,26 @@ export function ImportDialog(): JSX.Element | null {
           message: (importError as Error).message,
         });
       }
+    }
+  };
+
+  /**
+   * Run the downloader through its paces and report what it finds.
+   *
+   * "It timed out" is not something anyone can act on. The difference
+   * between "no binary", "binary will not start" and "cannot reach
+   * YouTube" needs three different responses, so the app should say which
+   * one it is rather than making the user guess.
+   */
+  const runDiagnosis = async (): Promise<void> => {
+    setDiagnosing(true);
+    setDiagnosis(null);
+    try {
+      setDiagnosis(await window.sipra.youtube.diagnose());
+    } catch (diagnoseError) {
+      setError((diagnoseError as Error).message);
+    } finally {
+      setDiagnosing(false);
     }
   };
 
@@ -206,7 +229,46 @@ export function ImportDialog(): JSX.Element | null {
           {error ? (
             <div className="workspace__warning" style={{ margin: 0 }}>
               <WarningIcon size={16} />
-              <span>{error}</span>
+              <div className="grow">
+                <div>{error}</div>
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  style={{ marginTop: 8 }}
+                  onClick={() => void runDiagnosis()}
+                  disabled={diagnosing}
+                >
+                  {diagnosing ? 'Checking the downloader…' : 'Check the downloader'}
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {diagnosis ? (
+            <div className="field">
+              <span className="field__label">Downloader check</span>
+              <p className="field__hint">
+                {diagnosis.available
+                  ? `Found${diagnosis.version ? ` (${diagnosis.version})` : ''}`
+                  : 'Not found in this build'}
+                {diagnosis.canReachYoutube === true ? ' · can reach YouTube' : ''}
+                {diagnosis.canReachYoutube === false ? ' · cannot reach YouTube' : ''}
+                {diagnosis.forcedIpv4 ? ' · forced to IPv4' : ''}
+              </p>
+              {diagnosis.error ? (
+                <p className="field__hint" style={{ color: 'var(--danger)' }}>
+                  {diagnosis.error}
+                </p>
+              ) : null}
+              {diagnosis.hints.length > 0 ? (
+                <ul className="field__hint" style={{ margin: 0, paddingLeft: 18 }}>
+                  {diagnosis.hints.map((hint) => (
+                    <li key={hint} style={{ marginBottom: 4 }}>
+                      {hint}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
             </div>
           ) : null}
 

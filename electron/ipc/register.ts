@@ -521,6 +521,13 @@ export function registerIpc(context: IpcContext): void {
     }
   });
 
+  handle(CHANNELS.youtubeDiagnose, async () => {
+    await ensureRuntime();
+    // Runs yt-dlp twice and may sit on a network timeout, so it gets a
+    // ceiling of its own rather than the default request timeout.
+    return sidecar.request('youtube.diagnose', {}, 8 * 60_000);
+  });
+
   handle(CHANNELS.youtubeMetadata, async (url) => {
     await ensureRuntime();
     return sidecar.request('youtube.metadata', { url: requireString(url, 'url') }, 120_000);

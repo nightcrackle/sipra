@@ -80,8 +80,20 @@ export class Sidecar extends EventEmitter {
     return this.ready && this.isRunning;
   }
 
-  configure(options: SidecarOptions): void {
-    this.options = options;
+  /**
+   * Update the spawn options.
+   *
+   * Merges rather than replaces. `ensureRuntime` calls this once the
+   * Python path is known, and an outright replacement quietly dropped the
+   * `onStderr` handler wired up at construction — taking the sidecar's
+   * diagnostics with it.
+   */
+  configure(options: Partial<SidecarOptions> & { pythonPath: string }): void {
+    this.options = {
+      ...this.options,
+      ...options,
+      env: { ...this.options.env, ...options.env },
+    };
   }
 
   async start(): Promise<void> {
@@ -152,7 +164,8 @@ export class Sidecar extends EventEmitter {
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
         this.stderrTail.push(chunk);
-        if (this.stderrTail.length > 80) this.stderrTail.shift();
+        // Bounded so a chatty dependency cannot grow this without limit.
+        if (this.stderrTail.length > 200) this.stderrTail.shift();
         this.options.onStderr?.(chunk);
       });
 
@@ -284,7 +297,7 @@ export class Sidecar extends EventEmitter {
           new SidecarError({
             code: 'SIDECAR_TIMEOUT',
             message: `The audio engine did not answer '${method}' in time.`,
-            details: { method, timeoutMs },
+            details: { method, timeoutMs, stderr: this.diagnostics.slice(-1500) },
           }),
         );
       }, timeoutMs);

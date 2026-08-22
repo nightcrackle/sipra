@@ -15,6 +15,9 @@ Everything is written under a per-track directory::
 
 from __future__ import annotations
 
+import os
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +47,16 @@ STAGE_WEIGHTS: tuple[tuple[str, float], ...] = (
 )
 
 DEFAULT_STEM_SUBTYPE = "PCM_16"
+
+# Set SIPRA_TRACE_STAGES=1 to have each pipeline stage announce itself on
+# stderr with a timestamp. Turns "it stopped at 80%" into a line naming the
+# exact step that did not finish.
+_TRACE = os.environ.get("SIPRA_TRACE_STAGES") == "1"
+
+
+def _log_stage(message: str) -> None:
+    if _TRACE:
+        print(f"[sipra {time.monotonic():9.3f}s] {message}", file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -168,6 +181,7 @@ def separate_track(
     progress.report("decode", 0.0)
     if token:
         token.raise_if_cancelled()
+    _log_stage(f"decoding {Path(input_path).name}")
     source = load_audio(input_path)
     progress.report("decode", 1.0)
 
@@ -176,6 +190,7 @@ def separate_track(
     # -- separate -------------------------------------------------------
     if token:
         token.raise_if_cancelled()
+    _log_stage(f"separating with {engine.id}/{resolved_model}")
     result = engine.separate(
         SeparationRequest(
             audio=source.data,
@@ -209,13 +224,26 @@ def separate_track(
         token.raise_if_cancelled()
     ordered = sort_stems(list(result.stems.keys()))
     artifacts: list[StemArtifact] = []
+    total_stems = max(1, len(ordered))
+
     for index, stem_id in enumerate(ordered):
         if token:
             token.raise_if_cancelled()
+
+        # Report *before* the work as well as after. Writing a stem of a
+        # long track is tens of megabytes of clipping, transposing and
+        # disk I/O; reporting only on completion leaves the bar sitting on
+        # the previous stage's boundary for the whole of it, which reads as
+        # a freeze rather than as progress.
+        progress.report("write", index / total_stems)
+        _log_stage(f"writing {stem_id}")
+
         audio = result.stems[stem_id]
         audio_path = write_audio(
             stems_dir / f"{stem_id}.wav", audio, out_rate, subtype=stem_subtype
         )
+        progress.report("write", (index + 0.5) / total_stems)
+
         peak_data = compute_peaks(audio, out_rate, DEFAULT_SAMPLES_PER_BUCKET)
         peaks_path = write_peaks(peaks_dir / f"{stem_id}.speaks", peak_data)
         artifacts.append(
@@ -227,9 +255,18 @@ def separate_track(
                 rms_db=_rms_db(audio),
             )
         )
-        progress.report("write", (index + 1) / max(1, len(ordered)))
+
+        # Release each stem as soon as it is on disk. Six stems of a long
+        # track held together with the source and whatever the engine has
+        # not freed is enough to push a 16 GB machine into swap, which is
+        # what turns "slow" into "frozen".
+        result.stems.pop(stem_id, None)
+        del audio
+
+        progress.report("write", (index + 1) / total_stems)
 
     # -- source copy and its peaks --------------------------------------
+    _log_stage("writing the source copy and its waveform")
     progress.report("peaks", 0.2)
     source_path = track_dir / "source.wav"
     if keep_source_copy:
@@ -245,6 +282,9 @@ def separate_track(
     if analyse:
         if token:
             token.raise_if_cancelled()
+        # The first analysis in a process pays numba's JIT compilation,
+        # which can take the better part of a minute on a cold machine.
+        _log_stage("measuring tempo, key and loudness")
         try:
             analysis = analyse_buffer(
                 AudioBuffer(data=source.data, sample_rate=out_rate),

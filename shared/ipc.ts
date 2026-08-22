@@ -55,6 +55,7 @@ export const CHANNELS = {
   filesResolveDropped: 'files:resolve-dropped',
 
   youtubeStatus: 'youtube:status',
+  youtubeDiagnose: 'youtube:diagnose',
   youtubeMetadata: 'youtube:metadata',
   youtubeImport: 'youtube:import',
 
@@ -101,6 +102,17 @@ export interface AppInfo {
   workspaceDir: string;
   isPackaged: boolean;
   bundledYtdlp: boolean;
+}
+
+export interface YoutubeDiagnosis {
+  available: boolean;
+  path: string | null;
+  version: string | null;
+  canReachYoutube: boolean | null;
+  error: string | null;
+  hints: string[];
+  forcedIpv4: boolean;
+  timeouts: { preflightSeconds: number; metadataSeconds: number; downloadSeconds: number };
 }
 
 export interface Notice {
@@ -165,6 +177,8 @@ export interface SipraApi {
 
   youtube: {
     status(): Promise<{ available: boolean; allowedHosts: string[]; maxDurationSeconds: number }>;
+    /** A plain report of what is and is not working, for when an import fails. */
+    diagnose(): Promise<YoutubeDiagnosis>;
     metadata(url: string): Promise<{
       title: string;
       durationSeconds: number | null;

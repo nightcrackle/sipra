@@ -85,9 +85,14 @@ function buildServices(): Services {
     env: {
       SIPRA_BIN_DIR: binDir,
       SIPRA_FFMPEG: path.join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+      // Stage tracing is cheap and makes a stalled job locatable. On in
+      // development always; in a packaged build only if asked for.
+      SIPRA_TRACE_STAGES: process.env.SIPRA_TRACE_STAGES ?? (isDev ? '1' : '0'),
     },
     onStderr: (chunk) => {
-      if (isDev) process.stderr.write(`[sidecar] ${chunk}`);
+      // Always surfaced, not just in development: when a user reports a
+      // job that appears frozen, this is the record of where it stopped.
+      process.stderr.write(`[sidecar] ${chunk}`);
     },
   });
 

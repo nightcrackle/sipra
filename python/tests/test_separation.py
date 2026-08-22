@@ -250,3 +250,82 @@ class TestSeparateTrack:
             engine_id="fixture", model_id="fixture-4", analyse=False,
         )
         assert len(outcome.stems) == 4
+
+
+class TestWriteStageProgress:
+    """Regression: the bar sat at exactly 80% for the whole write stage.
+
+    80% is the boundary between `separate` and `write` in STAGE_WEIGHTS.
+    The loop reported only on completion of each stem, so between
+    "separation finished" and "first stem written" — tens of megabytes of
+    clipping, transposing and disk I/O on a real track — nothing was
+    emitted at all, and the job looked frozen.
+    """
+
+    def test_reports_more_than_once_per_stem(self, source_wav, tmp_path, registry):
+        seen: list[tuple[str, float]] = []
+        separate_track(
+            source_wav, tmp_path / "t", registry=registry,
+            engine_id="fixture", model_id="fixture-4", analyse=False,
+            on_progress=lambda stage, fraction: seen.append((stage, fraction)),
+        )
+        write_reports = [fraction for stage, fraction in seen if stage == "write"]
+        # Four stems, reported at the start, mid-point and end of each.
+        assert len(write_reports) >= 8
+
+    def test_the_bar_never_jumps_a_whole_stem_during_the_write_stage(
+        self, source_wav, tmp_path, registry
+    ):
+        seen: list[float] = []
+        separate_track(
+            source_wav, tmp_path / "t", registry=registry,
+            engine_id="fixture", model_id="fixture-6", analyse=False,
+            on_progress=lambda stage, fraction: seen.append(fraction)
+            if stage == "write"
+            else None,
+        )
+        gaps = [b - a for a, b in zip(seen, seen[1:], strict=False)]
+        # The write stage is 8% of the bar across six stems; no single step
+        # should cover a whole stem's worth of it.
+        assert gaps, "the write stage reported nothing"
+        assert max(gaps) <= 0.08 / 6 + 1e-9
+
+    def test_progress_is_still_monotonic_with_the_extra_reports(
+        self, source_wav, tmp_path, registry
+    ):
+        seen: list[float] = []
+        separate_track(
+            source_wav, tmp_path / "t", registry=registry,
+            engine_id="fixture", model_id="fixture-6", analyse=False,
+            on_progress=lambda _stage, fraction: seen.append(fraction),
+        )
+        assert seen == sorted(seen)
+        assert seen[-1] == pytest.approx(1.0)
+
+    def test_stems_are_released_as_they_are_written(self, source_wav, tmp_path, registry):
+        """Holding six stems, the source and whatever the engine has not
+        freed is enough to push a modest machine into swap, which is what
+        turns a slow stage into an apparently frozen one."""
+        from sipra_core.engines.testing import FixtureEngine
+
+        captured: dict[str, object] = {}
+        original = FixtureEngine.separate
+
+        def spy(self, request, on_progress=None, token=None):
+            result = original(self, request, on_progress=on_progress, token=token)
+            captured["stems"] = result.stems
+            return result
+
+        FixtureEngine.separate = spy
+        try:
+            outcome = separate_track(
+                source_wav, tmp_path / "t", registry=registry,
+                engine_id="fixture", model_id="fixture-6", analyse=False,
+            )
+        finally:
+            FixtureEngine.separate = original
+
+        assert len(outcome.stems) == 6
+        # Every stem should have been dropped from the engine's result as
+        # soon as it reached disk.
+        assert captured["stems"] == {}

@@ -48,13 +48,45 @@ ALLOWED_HOSTS: tuple[str, ...] = (
     "youtu.be",
 )
 
-DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
-METADATA_TIMEOUT_SECONDS = 60
+def _timeout_from_env(name: str, default: int) -> int:
+    """Read a timeout override, ignoring anything unusable."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+DOWNLOAD_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_DOWNLOAD_TIMEOUT", 20 * 60)
+
+# Reading metadata is one HTTPS round trip, but the wall-clock cost is not
+# that. yt-dlp for Windows is a PyInstaller single-file bundle: the first
+# run unpacks ~17 MB into %TEMP% and Windows Defender scans it as it goes,
+# which on a cold machine can take most of a minute on its own. 60 s was
+# too tight for that and produced timeouts that looked like network
+# failures. The unpack cost is now paid once in `ensure_ready`, and this
+# covers the request itself with room to spare.
+METADATA_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_METADATA_TIMEOUT", 120)
+
+# One-off cost of unpacking the bundle and starting the interpreter.
+PREFLIGHT_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_PREFLIGHT_TIMEOUT", 180)
+
+# Bound yt-dlp's own network waits. Without these it will sit on a
+# half-open socket until *our* timeout fires, which turns a routing problem
+# into an opaque "timed out" with nothing in stderr to explain it.
+SOCKET_TIMEOUT_SECONDS = 15
+NETWORK_RETRIES = 2
 
 # Refuse anything long enough to be a full DJ set or a re-upload of an album.
 MAX_DURATION_SECONDS = 60 * 20
 
 _PROGRESS_PATTERN = re.compile(r"\[download\]\s+([0-9.]+)%")
+
+# A YouTube video id is exactly 11 characters from a fixed alphabet.
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 @dataclass(frozen=True)
@@ -89,6 +121,59 @@ def is_supported_url(url: str) -> bool:
     return host in ALLOWED_HOSTS
 
 
+def video_id_of(url: str) -> str | None:
+    """Extract the video id from a YouTube URL, or ``None``.
+
+    Worth doing before spawning anything. A link that was truncated on the
+    way through a chat client — ``…/watch?v=`` with nothing after it — is
+    not a link yt-dlp can do anything useful with, and handing it over
+    produces a slow, confusing failure instead of an instant clear one.
+    """
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or "").lower()
+    candidate: str | None = None
+
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/")[0]
+    elif host in ALLOWED_HOSTS:
+        path = parsed.path.rstrip("/")
+        if path in ("/watch", "/watch/"):
+            from urllib.parse import parse_qs
+
+            values = parse_qs(parsed.query).get("v") or []
+            candidate = values[0] if values else None
+        elif path.startswith(("/shorts/", "/embed/", "/live/", "/v/")):
+            candidate = path.split("/")[2] if len(path.split("/")) > 2 else None
+
+    if not candidate:
+        return None
+    return candidate if _VIDEO_ID.match(candidate) else None
+
+
+def _reject_unusable_url(url: str) -> None:
+    """Raise a specific error for a URL that cannot possibly work."""
+    if not is_supported_url(url):
+        raise SipraError(
+            ErrorCode.UNSUPPORTED_URL,
+            "Sipra only accepts YouTube links, and the link needs to start with https://.",
+            {"allowedHosts": list(ALLOWED_HOSTS), "url": str(url)[:200]},
+        )
+    if video_id_of(url) is None:
+        raise SipraError(
+            ErrorCode.UNSUPPORTED_URL,
+            "That link has no video in it. A YouTube link should look like "
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ — check the whole "
+            "address was copied, including the part after 'v='.",
+            {"url": str(url)[:200]},
+        )
+
+
 def ytdlp_path() -> str | None:
     """Locate yt-dlp: explicit override, bundled binary, then PATH."""
     override = os.environ.get("SIPRA_YTDLP")
@@ -115,6 +200,165 @@ def _creation_flags() -> int:
     return 0
 
 
+_READY_CACHE: dict[str, str] = {}
+
+
+def _hint_lines() -> list[str]:
+    """Things that actually fix a hanging yt-dlp, in rough order."""
+    return [
+        "Check the machine is online and can reach youtube.com in a browser.",
+        "If you are behind a proxy or VPN, yt-dlp needs it too "
+        "(set HTTPS_PROXY in the environment).",
+        "A half-configured IPv6 stack is a common cause of exactly this hang. "
+        "Set SIPRA_YTDLP_FORCE_IPV4=1 to make yt-dlp use IPv4 only.",
+        "Some antivirus products hold the first run of yt-dlp.exe for a long "
+        "time while they scan it. Running it once yourself from a terminal "
+        "gets that out of the way.",
+    ]
+
+
+def _network_args() -> list[str]:
+    """Flags that stop yt-dlp waiting forever on a dead connection."""
+    args = [
+        "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
+        "--retries", str(NETWORK_RETRIES),
+        "--no-color",
+    ]
+    if os.environ.get("SIPRA_YTDLP_FORCE_IPV4") == "1":
+        args.append("-4")
+    return args
+
+
+def _run_ytdlp(
+    exe: str, args: list[str], timeout: int, doing: str
+) -> subprocess.CompletedProcess:
+    """Run yt-dlp, converting process-level failures into ``SipraError``.
+
+    Without this, a ``TimeoutExpired`` propagates as an unhandled exception
+    and reaches the user as "Unexpected failure: Command [...] timed out",
+    which tells them nothing they can act on.
+    """
+    try:
+        return subprocess.run(
+            [exe, *args],
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+            creationflags=_creation_flags(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SipraError(
+            ErrorCode.DOWNLOAD_FAILED,
+            f"yt-dlp did not respond within {timeout} seconds while {doing}.",
+            {
+                "timeoutSeconds": timeout,
+                "doing": doing,
+                "hints": _hint_lines(),
+                "stderr": _decode(exc.stderr)[-600:],
+            },
+        ) from exc
+    except OSError as exc:
+        raise SipraError(
+            ErrorCode.DOWNLOADER_UNAVAILABLE,
+            f"Sipra could not start yt-dlp: {exc}",
+            {"path": exe},
+        ) from exc
+
+
+def _decode(raw: bytes | str | None) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", "replace")
+
+
+def ensure_ready() -> str:
+    """Confirm yt-dlp starts, and report its version.
+
+    Run once and cached. On Windows the packaged yt-dlp is a PyInstaller
+    single-file bundle that unpacks itself into %TEMP% the first time it
+    runs, which can take a long while on a cold machine with an antivirus
+    watching. Paying that here means the first real request is not the one
+    that appears to hang.
+    """
+    exe = _require_ytdlp()
+    cached = _READY_CACHE.get(exe)
+    if cached is not None:
+        return cached
+
+    proc = _run_ytdlp(exe, ["--version"], PREFLIGHT_TIMEOUT_SECONDS, "starting up")
+    if proc.returncode != 0:
+        raise SipraError(
+            ErrorCode.DOWNLOADER_UNAVAILABLE,
+            "yt-dlp is present but would not run.",
+            {"path": exe, "stderr": _decode(proc.stderr)[-600:]},
+        )
+
+    version = _decode(proc.stdout).strip().splitlines()[0] if proc.stdout else "unknown"
+    _READY_CACHE[exe] = version
+    return version
+
+
+def reset_ready_cache() -> None:
+    """Forget the cached preflight result. Used by tests."""
+    _READY_CACHE.clear()
+
+
+def diagnose() -> dict:
+    """A plain report of what is and is not working, for the UI.
+
+    Exists because "it timed out" is not something a user can act on, and
+    the difference between "no binary", "binary will not start" and
+    "cannot reach YouTube" needs three different responses.
+    """
+    exe = ytdlp_path()
+    report: dict = {
+        "available": exe is not None,
+        "path": exe,
+        "version": None,
+        "canReachYoutube": None,
+        "error": None,
+        "hints": [],
+        "forcedIpv4": os.environ.get("SIPRA_YTDLP_FORCE_IPV4") == "1",
+        "timeouts": {
+            "preflightSeconds": PREFLIGHT_TIMEOUT_SECONDS,
+            "metadataSeconds": METADATA_TIMEOUT_SECONDS,
+            "downloadSeconds": DOWNLOAD_TIMEOUT_SECONDS,
+        },
+    }
+    if exe is None:
+        report["error"] = "yt-dlp is not available in this build of Sipra."
+        return report
+
+    try:
+        report["version"] = ensure_ready()
+    except SipraError as exc:
+        report["error"] = exc.message
+        report["hints"] = list(exc.details.get("hints") or _hint_lines())
+        return report
+
+    # A real request against a stable, well-known video id.
+    try:
+        proc = _run_ytdlp(
+            exe,
+            [*_network_args(), "--no-playlist", "--skip-download", "--print", "id",
+             "--", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+            METADATA_TIMEOUT_SECONDS,
+            "checking the connection to YouTube",
+        )
+        report["canReachYoutube"] = proc.returncode == 0
+        if proc.returncode != 0:
+            report["error"] = _decode(proc.stderr)[-600:]
+            report["hints"] = _hint_lines()
+    except SipraError as exc:
+        report["canReachYoutube"] = False
+        report["error"] = exc.message
+        report["hints"] = list(exc.details.get("hints") or _hint_lines())
+
+    return report
+
+
 def _require_ytdlp() -> str:
     exe = ytdlp_path()
     if not exe:
@@ -128,32 +372,31 @@ def _require_ytdlp() -> str:
 
 def fetch_metadata(url: str) -> dict:
     """Read title/duration without downloading the media."""
-    if not is_supported_url(url):
-        raise SipraError(
-            ErrorCode.UNSUPPORTED_URL,
-            "Sipra only accepts YouTube links.",
-            {"allowedHosts": list(ALLOWED_HOSTS)},
-        )
+    _reject_unusable_url(url)
     exe = _require_ytdlp()
+    ensure_ready()
 
-    proc = subprocess.run(
-        [exe, "--no-playlist", "--skip-download", "--dump-single-json", "--", url],
-        capture_output=True,
-        check=False,
-        timeout=METADATA_TIMEOUT_SECONDS,
-        creationflags=_creation_flags(),
+    proc = _run_ytdlp(
+        exe,
+        [*_network_args(), "--no-playlist", "--skip-download", "--dump-single-json",
+         "--", url],
+        METADATA_TIMEOUT_SECONDS,
+        "reading that link",
     )
     if proc.returncode != 0:
+        stderr = _decode(proc.stderr)
         raise SipraError(
             ErrorCode.DOWNLOAD_FAILED,
-            "Could not read that link.",
-            {"stderr": proc.stderr.decode("utf-8", "replace")[-600:]},
+            _explain_ytdlp_failure(stderr),
+            {"stderr": stderr[-600:]},
         )
     try:
-        info = json.loads(proc.stdout.decode("utf-8", "replace"))
+        info = json.loads(_decode(proc.stdout))
     except json.JSONDecodeError as exc:
         raise SipraError(
-            ErrorCode.DOWNLOAD_FAILED, "yt-dlp returned unreadable metadata"
+            ErrorCode.DOWNLOAD_FAILED,
+            "yt-dlp returned something Sipra could not read.",
+            {"stdout": _decode(proc.stdout)[:400]},
         ) from exc
 
     return {
@@ -162,6 +405,29 @@ def fetch_metadata(url: str) -> dict:
         "uploader": info.get("uploader") or info.get("channel"),
         "sourceUrl": info.get("webpage_url") or url,
     }
+
+
+def _explain_ytdlp_failure(stderr: str) -> str:
+    """Turn yt-dlp's stderr into something a musician can act on."""
+    text = stderr.lower()
+    if "private video" in text:
+        return "That video is private."
+    if "video unavailable" in text or "not available" in text:
+        return "That video is unavailable — it may have been removed or be region-locked."
+    if "confirm your age" in text or "age-restricted" in text:
+        return "That video is age-restricted, so yt-dlp cannot read it without signing in."
+    if "sign in to confirm" in text or "not a bot" in text:
+        return (
+            "YouTube asked yt-dlp to prove it is not a bot. This usually clears on its "
+            "own; updating yt-dlp often helps too."
+        )
+    if "unable to download webpage" in text or "getaddrinfo" in text or "resolve" in text:
+        return "Could not reach YouTube. Check the machine is online."
+    if "http error 429" in text or "too many requests" in text:
+        return "YouTube is rate-limiting this machine. Wait a few minutes and try again."
+    if "unsupported url" in text:
+        return "yt-dlp did not recognise that link."
+    return "Could not read that link. The details below are from yt-dlp."
 
 
 def download_audio(
@@ -183,14 +449,10 @@ def download_audio(
             ErrorCode.RIGHTS_NOT_CONFIRMED,
             "Confirm you have the right to use this audio before downloading it.",
         )
-    if not is_supported_url(url):
-        raise SipraError(
-            ErrorCode.UNSUPPORTED_URL,
-            "Sipra only accepts YouTube links.",
-            {"allowedHosts": list(ALLOWED_HOSTS)},
-        )
+    _reject_unusable_url(url)
 
     exe = _require_ytdlp()
+    ensure_ready()
     dest = Path(destination_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -208,11 +470,11 @@ def download_audio(
 
     cmd = [
         exe,
+        *_network_args(),
         "--no-playlist",
         "--no-continue",
         "--no-part",
         "--newline",
-        "--no-color",
         "--extract-audio",
         "--audio-format", "wav",
         "--audio-quality", "0",
@@ -262,10 +524,11 @@ def download_audio(
             proc.stdout.close()
 
     if proc.returncode != 0:
+        stderr = "\n".join(stderr_tail)
         raise SipraError(
             ErrorCode.DOWNLOAD_FAILED,
-            "yt-dlp could not download that link.",
-            {"stderr": "\n".join(stderr_tail)[-600:]},
+            _explain_ytdlp_failure(stderr),
+            {"stderr": stderr[-600:]},
         )
 
     produced = _locate_output(target)

@@ -359,6 +359,11 @@ def _h_youtube_available(server: SipraServer, request: Request) -> dict:
     }
 
 
+def _h_youtube_diagnose(server: SipraServer, request: Request) -> dict:
+    """A plain report of what is and is not working with the downloader."""
+    return youtube.diagnose()
+
+
 def _h_youtube_metadata(server: SipraServer, request: Request) -> dict:
     return youtube.fetch_metadata(require(request.params, "url", str))
 
@@ -400,6 +405,7 @@ HANDLERS: dict[str, Handler] = {
     "separate": _h_separate,
     "mix.export": _h_export_mix,
     "youtube.available": _h_youtube_available,
+    "youtube.diagnose": _h_youtube_diagnose,
     "youtube.metadata": _h_youtube_metadata,
     "youtube.download": _h_youtube_download,
     "cancel": _h_cancel,
@@ -408,5 +414,15 @@ HANDLERS: dict[str, Handler] = {
 
 # Methods dispatched to the background worker.
 ASYNC_METHODS: frozenset[str] = frozenset(
-    {"analyze", "peaks", "separate", "mix.export", "youtube.download", "youtube.metadata"}
+    {
+        "analyze",
+        "peaks",
+        "separate",
+        "mix.export",
+        "youtube.download",
+        "youtube.metadata",
+        # Runs yt-dlp twice and may sit on a network timeout, so it must
+        # not block the reader thread.
+        "youtube.diagnose",
+    }
 )
