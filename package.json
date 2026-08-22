@@ -1,6 +1,6 @@
 {
   "name": "sipra",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "description": "Local stem separation and a waveform workspace for musicians. Your audio never leaves your computer.",
   "author": "Sipra",

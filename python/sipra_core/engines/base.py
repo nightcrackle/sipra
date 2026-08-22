@@ -36,6 +36,14 @@ class ModelInfo:
     # Rough multiple of real-time on a mid-range CPU. Used only to set
     # expectations in the UI, never for scheduling.
     relative_cost: float = 1.0
+    #: The rate this model works at.
+    #:
+    #: Declared so the pipeline can decode straight to it. Feeding a model
+    #: audio at some other rate means two conversions — one inside the
+    #: engine to get the model its input, and one afterwards to bring the
+    #: source copy back onto the same timebase as the stems — where
+    #: decoding at this rate in the first place needs none.
+    sample_rate: int = 44100
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +53,7 @@ class ModelInfo:
             "description": self.description,
             "experimental": self.experimental,
             "relativeCost": self.relative_cost,
+            "sampleRate": self.sample_rate,
         }
 
 

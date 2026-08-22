@@ -12,6 +12,67 @@ real hardware.
 
 ---
 
+## [0.9.5] — 2026-08-22
+
+The log from 0.9.4 named the step. The last line before the stall was
+
+    resampling the source copy | frm=48000 to=44100
+
+and no line ever followed it. That conversion is measured at well under a
+second on a track that size, so this release does not try to make it
+faster — it removes the need for it.
+
+### Fixed
+
+- **The source copy was converted after separation, and that is where a
+  job stopped.** Streaming audio arrives at 48 kHz and every model here
+  works at 44.1 kHz, so the source had to be brought onto the stems'
+  timebase or the playhead would drift between lanes. That was done after
+  separation, holding the whole result set in memory, reporting nothing.
+  Sipra now decodes straight to the model's declared rate, which makes the
+  conversion unnecessary rather than merely faster: the engine no longer
+  converts the input internally either, and where ffmpeg does the decoding
+  it does the rate change while streaming, before any of it is resident.
+- **A late progress report made the stage label go backwards.** The engine
+  sent a closing `separate` after the bar had already moved on to
+  `collect`, which is why the log reads "collect 84%, separate 85%, collect
+  86%". A sequence that goes backwards invites the reader to distrust all
+  of it, which is expensive when the log is the only evidence there is.
+
+### Changed
+
+- **A model now declares the rate it works at**, and the pipeline decodes
+  to it. Previously the rate was discovered from the separation result,
+  which is too late to act on.
+- **Rate conversion is done one channel at a time**, which halves the peak
+  allocation, and reports progress as it goes. The conversion that hung was
+  a single allocation of the whole track made at the moment the process was
+  holding the most memory it would hold all run — so this reduces the peak
+  as well as making it visible.
+- **The remaining post-separation conversion is a backstop**, reached only
+  if an engine's actual output rate differs from what it declared. It
+  traces and reports progress, so it can never again be an unexplained
+  pause.
+
+### Tests
+
+- 605 TypeScript tests, 474 Python tests. The per-channel conversion is
+  pinned sample-for-sample against the whole-array result, so halving the
+  memory cannot quietly change the audio. The pipeline regression is
+  asserted as the absence of a trace line that only exists on the
+  post-separation branch, and stage ordering is checked end to end.
+
+### Honest note
+
+A conversion that takes half a second here took over a minute there, and
+this release does not explain why. The most likely reading is memory
+pressure — it ran at the point in the job holding the most memory, and it
+allocated the whole track again — which is the same condition this change
+relieves. But if the next stall lands somewhere else, the log will name
+that step too.
+
+---
+
 ## [0.9.4] — 2026-08-22
 
 A separation that sits at 80% showing "Downloading audio". Four releases

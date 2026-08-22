@@ -19,7 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +27,7 @@ import numpy as np
 import soundfile as sf
 
 from .errors import ErrorCode, SipraError
+from .trace import trace
 
 # Extensions we advertise in the UI's file picker.
 SUPPORTED_INPUT_EXTENSIONS: tuple[str, ...] = (
@@ -125,13 +126,19 @@ def load_audio(
     path: str | Path,
     target_sample_rate: int | None = None,
     mono: bool = False,
+    on_progress: Callable[[float], None] | None = None,
 ) -> AudioBuffer:
     """Decode ``path`` into a float32 :class:`AudioBuffer`.
 
     Args:
         path: File to decode.
-        target_sample_rate: Resample to this rate when given.
+        target_sample_rate: Decode to this rate. Handed to ffmpeg where
+            ffmpeg does the decoding, so the conversion happens while
+            streaming rather than over a fully resident copy.
         mono: Average all channels down to one.
+        on_progress: Called with 0-1 across any rate conversion that has to
+            happen in memory. A conversion that reports nothing is
+            indistinguishable from one that has stopped.
     """
     p = Path(path)
     if not p.exists() or not p.is_file():
@@ -153,7 +160,7 @@ def load_audio(
         raise
     except Exception as sf_exc:
         try:
-            data, sr = _load_with_ffmpeg(p)
+            data, sr = _load_with_ffmpeg(p, target_sample_rate)
         except SipraError:
             raise
         except Exception as ff_exc:  # pragma: no cover - depends on host tools
@@ -177,7 +184,11 @@ def load_audio(
             sample_rate=buf.sample_rate,
         )
     if target_sample_rate and target_sample_rate != buf.sample_rate:
-        buf = resample(buf, target_sample_rate)
+        # Only reachable via libsndfile — the ffmpeg path was given the
+        # target rate and already produced it.
+        buf = resample(buf, target_sample_rate, on_progress=on_progress)
+    elif on_progress:
+        on_progress(1.0)
     return buf
 
 
@@ -187,7 +198,13 @@ def _load_with_soundfile(path: Path) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(data.T), int(sr)
 
 
-def _load_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
+def _load_with_ffmpeg(path: Path, target_sample_rate: int | None = None) -> tuple[np.ndarray, int]:
+    """Decode to float32 PCM, optionally converting the rate on the way.
+
+    Handing ffmpeg the target rate is free — it resamples while it streams,
+    before any of this is resident in memory. Doing it afterwards in numpy
+    means holding the whole track twice at the worst possible moment.
+    """
     exe = ffmpeg_path()
     if not exe:
         raise SipraError(
@@ -197,7 +214,7 @@ def _load_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
         )
 
     meta = _ffprobe_stream(exe, path)
-    sr = meta["sample_rate"]
+    sr = int(target_sample_rate) if target_sample_rate else meta["sample_rate"]
     channels = meta["channels"]
 
     cmd = [
@@ -273,8 +290,20 @@ def _ffprobe_stream(ffmpeg_exe: str, path: Path) -> dict:
     return fallback
 
 
-def resample(buf: AudioBuffer, target_sample_rate: int) -> AudioBuffer:
-    """Band-limited resample using SciPy's polyphase filter."""
+def resample(
+    buf: AudioBuffer,
+    target_sample_rate: int,
+    on_progress: Callable[[float], None] | None = None,
+) -> AudioBuffer:
+    """Band-limited resample using SciPy's polyphase filter.
+
+    Done one channel at a time. Two reasons, both learned the hard way from
+    a job that stopped at 86% with this call as the last thing it logged:
+    it halves the peak allocation, which matters because this used to run
+    with a whole separation's worth of stems still resident; and it gives
+    the caller somewhere to report from, so a slow conversion looks slow
+    rather than looking stopped.
+    """
     if target_sample_rate <= 0:
         raise SipraError(ErrorCode.INVALID_PARAMS, "target_sample_rate must be positive")
     if buf.sample_rate == target_sample_rate:
@@ -287,8 +316,23 @@ def resample(buf: AudioBuffer, target_sample_rate: int) -> AudioBuffer:
     divisor = gcd(int(buf.sample_rate), int(target_sample_rate))
     up = int(target_sample_rate) // divisor
     down = int(buf.sample_rate) // divisor
-    out = resample_poly(buf.data, up, down, axis=1).astype(np.float32, copy=False)
-    return AudioBuffer(data=np.ascontiguousarray(out), sample_rate=int(target_sample_rate))
+
+    channels = buf.data.shape[0]
+    trace("resampling", frm=buf.sample_rate, to=target_sample_rate, channels=channels)
+    converted: list[np.ndarray] = []
+    for index in range(channels):
+        if on_progress:
+            on_progress(index / channels)
+        # np.ascontiguousarray because a channel of a transposed buffer is
+        # strided, and the polyphase filter walks it sample by sample.
+        channel = np.ascontiguousarray(buf.data[index])
+        converted.append(resample_poly(channel, up, down).astype(np.float32, copy=False))
+        trace("resampled a channel", channel=index + 1, of=channels)
+    if on_progress:
+        on_progress(1.0)
+
+    out = np.ascontiguousarray(np.stack(converted, axis=0))
+    return AudioBuffer(data=out, sample_rate=int(target_sample_rate))
 
 
 def write_audio(

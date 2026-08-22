@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from sipra_core.audio_io import load_audio
 from sipra_core.engines.base import CancellationToken
@@ -32,6 +33,90 @@ def registry() -> EngineRegistry:
 def source_wav(wav_file):
     mixed = sine(110, 3.0) * 0.4 + sine(880, 3.0) * 0.3 + sine(4000, 3.0) * 0.15
     return wav_file(stereo(mixed.astype(np.float32)), name="input.wav")
+
+
+@pytest.fixture
+def source_wav_48k(wav_file):
+    """A 48 kHz source — what every YouTube import actually is."""
+    mixed = sine(110, 2.0, 48000) * 0.4 + sine(880, 2.0, 48000) * 0.3
+    return wav_file(stereo(mixed.astype(np.float32)), name="input48.wav", rate=48000)
+
+
+class TestRateHandling:
+    """Decoding at the model's rate, and what that removes.
+
+    A separated track and its source copy have to share one timebase or the
+    playhead drifts between lanes. That was achieved by converting the
+    source after separation — with the whole result set still in memory,
+    reporting nothing. A real job stopped there at 86%. Decoding to the
+    model's rate up front makes the conversion unnecessary instead of
+    making it faster.
+    """
+
+    def test_decodes_to_the_models_rate(self, source_wav_48k, tmp_path, registry):
+        outcome = separate_track(
+            source_wav_48k, tmp_path / "track", registry=registry,
+            engine_id="fixture", analyse=False,
+        )
+        assert outcome.sample_rate == 44100
+
+    def test_the_source_copy_shares_the_stems_timebase(
+        self, source_wav_48k, tmp_path, registry
+    ):
+        outcome = separate_track(
+            source_wav_48k, tmp_path / "track", registry=registry,
+            engine_id="fixture", analyse=False,
+        )
+        source_rate = sf.info(str(outcome.source_path)).samplerate
+        for artifact in outcome.stems:
+            assert sf.info(str(artifact.audio_path)).samplerate == source_rate
+
+    def test_never_converts_the_source_after_separation(
+        self, source_wav_48k, tmp_path, registry, monkeypatch, capsys
+    ):
+        """The regression, stated as the absence of a step.
+
+        The trace line only exists on the post-separation branch, so its
+        absence is the assertion: that branch did not run.
+        """
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        separate_track(
+            source_wav_48k, tmp_path / "track", registry=registry,
+            engine_id="fixture", analyse=False,
+        )
+        assert "resampling the source copy" not in capsys.readouterr().err
+
+    def test_a_44k_source_needs_no_conversion_at_all(
+        self, source_wav, tmp_path, registry, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        separate_track(
+            source_wav, tmp_path / "track", registry=registry,
+            engine_id="fixture", analyse=False,
+        )
+        err = capsys.readouterr().err
+        assert "resampling" not in err
+
+    def test_progress_never_returns_to_an_earlier_stage(
+        self, source_wav_48k, tmp_path, registry
+    ):
+        """Stages must run in order and stay there.
+
+        A real log read "collect 84%, separate 85%, collect 86%" — the
+        engine reported a closing `separate` after the bar had already
+        moved on. A sequence that goes backwards invites the reader to
+        distrust all of it, which is expensive when the log is the only
+        evidence there is.
+        """
+        order = [name for name, _weight in STAGE_WEIGHTS]
+        seen: list[str] = []
+        separate_track(
+            source_wav_48k, tmp_path / "track", registry=registry,
+            engine_id="fixture", analyse=False,
+            on_progress=lambda stage, _f: seen.append(stage),
+        )
+        indices = [order.index(stage) for stage in seen if stage in order]
+        assert indices == sorted(indices), seen
 
 
 class TestStageProgress:

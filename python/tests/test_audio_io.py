@@ -141,6 +141,82 @@ class TestResample:
         with pytest.raises(SipraError):
             resample(AudioBuffer(np.zeros((1, 10), dtype=np.float32), 44100), 0)
 
+    def test_per_channel_conversion_matches_converting_the_whole_array(self):
+        """The safety net on splitting this up.
+
+        Channels are converted one at a time to halve the peak allocation
+        and to give the caller something to report. That is only acceptable
+        if it changes nothing about the audio, so this pins it to the
+        whole-array result sample for sample.
+        """
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        left = sine(220, 0.5, 48000)
+        right = sine(770, 0.5, 48000) * 0.6
+        buf = AudioBuffer(np.stack([left, right]).astype(np.float32), 48000)
+
+        divisor = gcd(48000, 44100)
+        expected = resample_poly(buf.data, 44100 // divisor, 48000 // divisor, axis=1)
+        out = resample(buf, 44100)
+
+        assert out.data.shape == expected.shape
+        assert np.allclose(out.data, expected, atol=1e-6)
+
+    def test_reports_progress_from_zero_to_one(self):
+        """A conversion that reports nothing looks like one that stopped.
+
+        This ran unreported between the end of separation and the first
+        stem write, which is where a real job sat at 86% with no way to
+        tell whether anything was happening.
+        """
+        seen: list[float] = []
+        buf = AudioBuffer(stereo(sine(440, 0.2, 48000)), 48000)
+        resample(buf, 44100, on_progress=seen.append)
+        assert seen[0] == 0.0
+        assert seen[-1] == 1.0
+        assert seen == sorted(seen)
+        # One report per channel, plus the closing one.
+        assert len(seen) == 3
+
+    def test_a_missing_progress_callback_is_harmless(self):
+        buf = AudioBuffer(stereo(sine(440, 0.1, 48000)), 48000)
+        assert resample(buf, 44100, on_progress=None).sample_rate == 44100
+
+    def test_converts_a_strided_buffer_the_same_as_a_contiguous_one(self):
+        """A channel of a transposed buffer is strided.
+
+        The polyphase filter walks it sample by sample, so it is made
+        contiguous first. This checks that doing so changes no values.
+        """
+        interleaved = np.stack([sine(300, 0.3, 48000), sine(900, 0.3, 48000)], axis=1)
+        strided = interleaved.T
+        assert not strided.flags["C_CONTIGUOUS"]
+
+        from_strided = resample(AudioBuffer(strided, 48000), 44100)
+        from_contiguous = resample(AudioBuffer(np.ascontiguousarray(strided), 48000), 44100)
+        assert np.array_equal(from_strided.data, from_contiguous.data)
+
+    def test_output_is_contiguous(self):
+        buf = AudioBuffer(stereo(sine(440, 0.2, 48000)), 48000)
+        assert resample(buf, 44100).data.flags["C_CONTIGUOUS"]
+
+    def test_converts_mono(self):
+        buf = AudioBuffer(sine(440, 0.2, 48000)[np.newaxis, :], 48000)
+        out = resample(buf, 44100)
+        assert out.data.shape[0] == 1
+        assert out.frames == pytest.approx(8820, abs=2)
+
+    def test_the_common_case_is_48k_to_cd_rate(self):
+        """What every URL import needs.
+
+        Streaming audio arrives at 48 kHz and every separation model here
+        works at 44.1 kHz.
+        """
+        buf = AudioBuffer(stereo(sine(440, 1.0, 48000)), 48000)
+        assert resample(buf, 44100).frames == pytest.approx(44100, abs=2)
+
 
 class TestWriteAudio:
     def test_creates_parent_directories(self, tmp_path):

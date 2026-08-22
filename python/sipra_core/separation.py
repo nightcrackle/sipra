@@ -187,8 +187,27 @@ def separate_track(
     progress.report("decode", 0.0)
     if token:
         token.raise_if_cancelled()
-    _log_stage(f"decoding {Path(input_path).name}")
-    source = load_audio(input_path)
+
+    # Decode straight to the model's rate.
+    #
+    # Every path that did not do this converted the audio twice: once
+    # inside the engine to give the model its input, and once afterwards to
+    # bring the source copy back onto the stems' timebase. The second
+    # conversion sat between the end of separation and the first stem
+    # write, with the whole result set still in memory, reporting nothing —
+    # which is exactly where a user's job stopped at 86% and never moved.
+    # Asking the decoder for the right rate makes both conversions
+    # unnecessary, and hands the work to ffmpeg, which does it while
+    # streaming and while nothing else is allocated.
+    engine_rate = int(getattr(model_info, "sample_rate", 0) or 0)
+    _log_stage(f"decoding {Path(input_path).name}", at=engine_rate or "source rate")
+    source = load_audio(
+        input_path,
+        target_sample_rate=engine_rate or None,
+        # Decoding is the first 6% of the bar; a rate conversion here gets
+        # the back half of it rather than happening in silence.
+        on_progress=lambda f: progress.report("decode", 0.5 + 0.5 * f),
+    )
     progress.report("decode", 1.0)
     _log_stage(
         "decoded",
@@ -243,8 +262,19 @@ def separate_track(
     if out_rate != source.sample_rate:
         from .audio_io import resample as _resample
 
+        # Decoding at the model's declared rate normally makes this
+        # unreachable. It stays as a backstop for an engine whose actual
+        # output rate differs from what it declared — but it now reports
+        # and traces, because the last time it ran unreported a job stopped
+        # here at 86% and gave no indication of what it was doing.
         _log_stage("resampling the source copy", frm=source.sample_rate, to=out_rate)
-        source = _resample(source, out_rate)
+        source = _resample(
+            source,
+            out_rate,
+            on_progress=lambda f: progress.report(
+                "collect", ENGINE_SHARE_OF_COLLECT + (1 - ENGINE_SHARE_OF_COLLECT) * f
+            ),
+        )
         _log_stage("resampled")
 
     # -- write stems ----------------------------------------------------

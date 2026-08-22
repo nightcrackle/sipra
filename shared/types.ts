@@ -42,6 +42,14 @@ export interface ModelDescriptor {
   description: string;
   experimental: boolean;
   relativeCost: number;
+  /**
+   * The rate the model works at.
+   *
+   * Sipra decodes straight to this, which is what keeps a separated track
+   * and its source copy on one timebase without converting anything after
+   * the fact.
+   */
+  sampleRate: number;
 }
 
 export interface EngineDescriptor {

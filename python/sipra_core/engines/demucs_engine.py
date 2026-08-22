@@ -50,6 +50,10 @@ DEMUCS_SOURCE_TO_STEM: dict[str, str] = {
     "other": "other",
 }
 
+# Every Demucs model works at CD rate. Declared before the model table so
+# each entry can name it, and so the pipeline can decode straight to it.
+DEMUCS_SAMPLE_RATE = 44100
+
 MODELS: tuple[ModelInfo, ...] = (
     ModelInfo(
         id="htdemucs",
@@ -57,6 +61,7 @@ MODELS: tuple[ModelInfo, ...] = (
         stems=FOUR_STEM_SET,
         description="The default. Cleanest results and the fastest of the good models.",
         relative_cost=1.0,
+        sample_rate=DEMUCS_SAMPLE_RATE,
     ),
     ModelInfo(
         id="htdemucs_ft",
@@ -64,6 +69,7 @@ MODELS: tuple[ModelInfo, ...] = (
         stems=FOUR_STEM_SET,
         description="Noticeably better separation, roughly four times slower.",
         relative_cost=4.0,
+        sample_rate=DEMUCS_SAMPLE_RATE,
     ),
     ModelInfo(
         id="htdemucs_6s",
@@ -75,6 +81,7 @@ MODELS: tuple[ModelInfo, ...] = (
         ),
         experimental=True,
         relative_cost=1.2,
+        sample_rate=DEMUCS_SAMPLE_RATE,
     ),
     ModelInfo(
         id="mdx_extra",
@@ -82,13 +89,13 @@ MODELS: tuple[ModelInfo, ...] = (
         stems=FOUR_STEM_SET,
         description="Alternative model; sometimes better on bass-heavy material.",
         relative_cost=1.3,
+        sample_rate=DEMUCS_SAMPLE_RATE,
     ),
 )
 
 MODELS_BY_ID: dict[str, ModelInfo] = {m.id: m for m in MODELS}
 
 DEFAULT_MODEL_ID = "htdemucs"
-DEMUCS_SAMPLE_RATE = 44100
 
 
 class DemucsEngine:
@@ -286,8 +293,11 @@ class DemucsEngine:
         if missing:
             warnings.append(f"Model did not return: {', '.join(missing)}")
 
-        if on_progress:
-            on_progress("separate", 1.0)
+        # No closing `separate` report. The collect loop above has already
+        # carried the bar past where separation ends, and a late report on
+        # the earlier stage made the label flap backwards — a log from a
+        # real run reads "collect 84%, separate 85%, collect 86%", which
+        # invites the reader to distrust the whole sequence.
 
         return SeparationResult(
             stems=out,
