@@ -7,6 +7,7 @@ import {
   formatConfidence,
   formatDb,
   formatDuration,
+  formatElapsed,
   formatEstimate,
   formatKey,
   formatLu,
@@ -231,5 +232,33 @@ describe('truncateMiddle', () => {
     expect(result).toHaveLength(20);
     expect(result).toContain('…');
     expect(result.endsWith('wav')).toBe(true);
+  });
+});
+
+describe('formatElapsed', () => {
+  it('renders under a minute as m:ss', () => {
+    expect(formatElapsed(0)).toBe('0:00');
+    expect(formatElapsed(7_000)).toBe('0:07');
+    expect(formatElapsed(59_999)).toBe('0:59');
+  });
+
+  it('pads the seconds so the width never changes', () => {
+    expect(formatElapsed(69_000)).toBe('1:09');
+    expect(formatElapsed(600_000)).toBe('10:00');
+  });
+
+  it('adds hours only once there are any', () => {
+    expect(formatElapsed(3_599_000)).toBe('59:59');
+    expect(formatElapsed(3_600_000)).toBe('1:00:00');
+    expect(formatElapsed(3_661_000)).toBe('1:01:01');
+  });
+
+  it('floors rather than rounding, so it never reads ahead of the clock', () => {
+    expect(formatElapsed(1_999)).toBe('0:01');
+  });
+
+  it('treats a negative or unreal span as zero', () => {
+    expect(formatElapsed(-5_000)).toBe('0:00');
+    expect(formatElapsed(Number.NaN)).toBe('0:00');
   });
 });

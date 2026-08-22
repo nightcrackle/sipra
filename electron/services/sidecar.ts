@@ -51,12 +51,29 @@ interface Pending {
   method: string;
 }
 
+/**
+ * One line in the request trace.
+ *
+ * `sent` when a request goes out, `settled` when its answer comes back —
+ * with the elapsed time, which is what tells a slow call apart from a
+ * hung one after the fact.
+ */
+export interface SidecarTrace {
+  phase: 'sent' | 'settled';
+  id: string;
+  method: string;
+  durationMs?: number;
+  outcome?: 'ok' | 'error' | 'timeout';
+  error?: string;
+}
+
 export interface SidecarOptions {
   pythonPath: string;
   /** Working directory containing the `sipra_core` package. */
   cwd: string;
   env?: Record<string, string | undefined>;
   onStderr?: (text: string) => void;
+  onTrace?: (trace: SidecarTrace) => void;
 }
 
 export class Sidecar extends EventEmitter {
@@ -290,9 +307,18 @@ export class Sidecar extends EventEmitter {
     }
 
     const id = randomUUID();
+    const startedAt = Date.now();
+    const trace = this.options.onTrace;
+    trace?.({ phase: 'sent', id, method });
+
+    const settle = (outcome: SidecarTrace['outcome'], error?: string): void => {
+      trace?.({ phase: 'settled', id, method, durationMs: Date.now() - startedAt, outcome, error });
+    };
+
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        settle('timeout');
         reject(
           new SidecarError({
             code: 'SIDECAR_TIMEOUT',
@@ -303,8 +329,14 @@ export class Sidecar extends EventEmitter {
       }, timeoutMs);
 
       this.pending.set(id, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
+        resolve: (value: unknown) => {
+          settle('ok');
+          resolve(value as T);
+        },
+        reject: (error: Error) => {
+          settle('error', error.message);
+          reject(error);
+        },
         timer,
         method,
       });
@@ -314,6 +346,7 @@ export class Sidecar extends EventEmitter {
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
+        settle('error', (error as Error).message);
         reject(
           new SidecarError({
             code: 'SIDECAR_WRITE_FAILED',

@@ -231,15 +231,30 @@ export function ImportDialog(): JSX.Element | null {
               <WarningIcon size={16} />
               <div className="grow">
                 <div>{error}</div>
-                <button
-                  type="button"
-                  className="btn btn--sm"
-                  style={{ marginTop: 8 }}
-                  onClick={() => void runDiagnosis()}
-                  disabled={diagnosing}
-                >
-                  {diagnosing ? 'Checking the downloader…' : 'Check the downloader'}
-                </button>
+                <div className="row" style={{ marginTop: 8, gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    onClick={() => void runDiagnosis()}
+                    disabled={diagnosing}
+                  >
+                    {diagnosing ? 'Checking the downloader…' : 'Check the downloader'}
+                  </button>
+                  {/*
+                    The log records what the app was doing when this went
+                    wrong, with timestamps. It is the only thing that can
+                    distinguish a slow step from a stopped one after the
+                    fact, so it is offered wherever a failure is shown.
+                  */}
+                  <button
+                    type="button"
+                    className="btn btn--ghost btn--sm"
+                    onClick={() => void window.sipra.logs.reveal()}
+                    title="Open the folder holding Sipra's diagnostic log"
+                  >
+                    Show the log
+                  </button>
+                </div>
               </div>
             </div>
           ) : null}

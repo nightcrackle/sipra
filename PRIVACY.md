@@ -70,6 +70,22 @@ Emptying the trash deletes them. Anything left in the trash for 30 days is
 removed automatically. Sipra will only ever delete a directory that sits
 inside its own workspace.
 
+## The diagnostic log
+
+Sipra keeps a plain-text log next to its other data, at
+`%APPDATA%\Sipra\logs\sipra.log`, with up to three rotated copies of
+around two megabytes each. It records what the app was doing and when:
+which stage each job reached, how long each call to the audio engine took,
+and anything the engine wrote to its error stream.
+
+It does contain the paths of files you import and the URLs you paste, and
+it does not contain any audio. It is written only to your own disk.
+Nothing in Sipra uploads it, and nothing in Sipra reads it back — it
+exists so that if a job appears to freeze, you have a timestamped record
+to look at or attach to a bug report. Deleting the folder is safe; it is
+recreated on the next run. "Show the log" in the import dialog, and the
+"Log" button on a job that has been running a while, both open it.
+
 ## If you use URL import
 
 The request goes from your machine to the site you linked, through

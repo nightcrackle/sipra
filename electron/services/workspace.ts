@@ -96,6 +96,42 @@ export interface ImportOptions {
   request: SeparateRequest;
   settings: Settings;
   jobId: string;
+  /**
+   * The slice of the job's bar this separation owns.
+   *
+   * A file dropped in owns all of it. A YouTube import spends the first
+   * part of the bar downloading, so its separation starts partway along —
+   * without this the separation reported 0-100% into a bar already at 30%,
+   * and since the bar never moves backwards it sat motionless at 30% until
+   * separation passed a third of the way through. That is the same
+   * "nothing is happening" symptom as a real stall.
+   */
+  progressFrom?: number;
+  progressTo?: number;
+}
+
+/**
+ * How much of a YouTube import's bar the download owns.
+ *
+ * Both the download's own progress and the separation that follows it are
+ * scaled against this one number, so the two halves cannot disagree about
+ * where the handover is.
+ */
+export const DOWNLOAD_SHARE = 0.3;
+
+/**
+ * Map a stage's own 0-1 fraction onto the slice of the bar it owns.
+ *
+ * A job can be made of more than one sidecar call — a YouTube import is a
+ * download followed by a separation — and each call reports 0 to 1 for
+ * itself. Without this the second call reported 0% into a bar the first
+ * had already advanced, and because the bar never moves backwards it stood
+ * still until the second call overtook it. Standing still is precisely the
+ * symptom of the fault this is meant to make visible.
+ */
+export function scaleProgress(fraction: number | undefined, from: number, to: number): number {
+  const value = Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction as number)) : 0;
+  return from + (to - from) * value;
 }
 
 export class WorkspaceService {
@@ -138,7 +174,7 @@ export class WorkspaceService {
    * library.
    */
   async importAndSeparate(options: ImportOptions): Promise<Track> {
-    const { request, settings, jobId } = options;
+    const { request, settings, jobId, progressFrom = 0, progressTo = 1 } = options;
     const trackId = randomUUID();
     const fileName = baseNameOf(request.path);
     const title = (request.title ?? stripExtension(fileName)).trim() || 'Untitled';
@@ -153,7 +189,7 @@ export class WorkspaceService {
 
     const trackDir = await this.allocateTrackDir(title, trackId);
 
-    const unsubscribe = this.subscribeProgress(jobId);
+    const unsubscribe = this.subscribeProgress(jobId, progressFrom, progressTo);
     let payload: SeparationPayload;
     try {
       payload = await this.sidecar.request<SeparationPayload>(
@@ -244,11 +280,11 @@ export class WorkspaceService {
    * Events carry the job id, so several jobs can be in flight without
    * their progress crossing over.
    */
-  private subscribeProgress(jobId: string): () => void {
+  private subscribeProgress(jobId: string, from = 0, to = 1): () => void {
     const handler = (data: unknown): void => {
       const payload = data as { jobId?: string; stage?: string; fraction?: number } | undefined;
       if (!payload || payload.jobId !== jobId) return;
-      this.jobs.progress(jobId, payload.stage ?? 'working', payload.fraction ?? 0);
+      this.jobs.progress(jobId, payload.stage ?? 'working', scaleProgress(payload.fraction, from, to));
     };
     this.sidecar.on('progress', handler);
     return () => {

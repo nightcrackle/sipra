@@ -15,9 +15,6 @@ Everything is written under a per-track directory::
 
 from __future__ import annotations
 
-import os
-import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +27,7 @@ from .engines.base import CancellationToken, SeparationRequest
 from .engines.registry import EngineRegistry
 from .errors import ErrorCode, SipraError
 from .stems import sort_stems
+from .trace import trace
 from .waveform import DEFAULT_SAMPLES_PER_BUCKET, compute_peaks, write_peaks
 
 ProgressFn = Callable[[str, float], None]
@@ -38,9 +36,17 @@ ProgressFn = Callable[[str, float], None]
 # so much that everything else is rounding error, but a bar that sits at
 # 100% for ten seconds while peaks are written feels broken, so the tail
 # stages get a visible slice.
+#
+# ``collect`` exists to break a tie. Before it, the end of ``separate``
+# and the start of ``write`` both landed on exactly 0.80, so a bar sitting
+# at 80% could mean the model was still finishing, or that the model had
+# finished and the first stem was being written — two different bugs with
+# one appearance. The work it names is real: moving each separated tensor
+# off the compute device and back into a numpy array.
 STAGE_WEIGHTS: tuple[tuple[str, float], ...] = (
     ("decode", 0.06),
-    ("separate", 0.74),
+    ("separate", 0.70),
+    ("collect", 0.04),
     ("write", 0.08),
     ("peaks", 0.06),
     ("analyse", 0.06),
@@ -48,15 +54,15 @@ STAGE_WEIGHTS: tuple[tuple[str, float], ...] = (
 
 DEFAULT_STEM_SUBTYPE = "PCM_16"
 
-# Set SIPRA_TRACE_STAGES=1 to have each pipeline stage announce itself on
-# stderr with a timestamp. Turns "it stopped at 80%" into a line naming the
-# exact step that did not finish.
-_TRACE = os.environ.get("SIPRA_TRACE_STAGES") == "1"
+#: How much of the ``collect`` stage belongs to the engine's own
+#: device-to-host transfer. The remainder covers resampling the source
+#: copy to the engine's rate, which happens for every 48 kHz import.
+ENGINE_SHARE_OF_COLLECT = 0.8
 
 
-def _log_stage(message: str) -> None:
-    if _TRACE:
-        print(f"[sipra {time.monotonic():9.3f}s] {message}", file=sys.stderr, flush=True)
+def _log_stage(message: str, **fields: object) -> None:
+    """Announce a pipeline step. See :mod:`sipra_core.trace`."""
+    trace(message, **fields)
 
 
 @dataclass
@@ -184,13 +190,32 @@ def separate_track(
     _log_stage(f"decoding {Path(input_path).name}")
     source = load_audio(input_path)
     progress.report("decode", 1.0)
+    _log_stage(
+        "decoded",
+        rate=source.sample_rate,
+        channels=source.data.shape[0],
+        seconds=round(source.data.shape[1] / max(1, source.sample_rate), 1),
+    )
 
     warnings: list[str] = []
 
     # -- separate -------------------------------------------------------
     if token:
         token.raise_if_cancelled()
-    _log_stage(f"separating with {engine.id}/{resolved_model}")
+    _log_stage(f"separating with {engine.id}/{resolved_model}", device=device or "auto")
+
+    # The engine names its own stage so that the device-transfer tail of a
+    # separation is distinguishable from the model run itself; anything it
+    # does not name counts as separation. The engine's share of `collect`
+    # is capped below the whole so the source resample that follows it has
+    # a band of its own — otherwise a stall in the resample would be
+    # indistinguishable from a stall in the first stem write.
+    def _engine_progress(stage: str, fraction: float) -> None:
+        if stage == "collect":
+            progress.report("collect", fraction * ENGINE_SHARE_OF_COLLECT)
+        else:
+            progress.report("separate", fraction)
+
     result = engine.separate(
         SeparationRequest(
             audio=source.data,
@@ -203,11 +228,12 @@ def separate_track(
             segment=segment,
             jobs=jobs,
         ),
-        on_progress=lambda _stage, fraction: progress.report("separate", fraction),
+        on_progress=_engine_progress,
         token=token,
     )
     warnings.extend(result.warnings)
-    progress.report("separate", 1.0)
+    progress.report("collect", 1.0)
+    _log_stage("separated", stems=len(result.stems), rate=result.sample_rate)
 
     out_rate = result.sample_rate
 
@@ -217,7 +243,9 @@ def separate_track(
     if out_rate != source.sample_rate:
         from .audio_io import resample as _resample
 
+        _log_stage("resampling the source copy", frm=source.sample_rate, to=out_rate)
         source = _resample(source, out_rate)
+        _log_stage("resampled")
 
     # -- write stems ----------------------------------------------------
     if token:

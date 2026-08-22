@@ -177,3 +177,45 @@ describe('JobRegistry', () => {
     expect(registry.list().map((job) => job.id)).toEqual([active.id]);
   });
 });
+
+describe('JobRegistry.relabel', () => {
+  it('renames a running job', () => {
+    // A YouTube import is created before its title is known, and used to
+    // keep the name "Downloading audio" through separation — so a job busy
+    // separating stems was reported as downloading.
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'Downloading audio' });
+    registry.start(job.id);
+    const renamed = registry.relabel(job.id, 'Wichita Lineman');
+    expect(renamed?.label).toBe('Wichita Lineman');
+    expect(renamed?.status).toBe('running');
+  });
+
+  it('emits an update so the panel repaints', () => {
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'Downloading audio' });
+    const seen = vi.fn();
+    registry.on('updated', seen);
+    registry.relabel(job.id, 'Something');
+    expect(seen).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the old label rather than blanking the row', () => {
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'Downloading audio' });
+    expect(registry.relabel(job.id, '   ')?.label).toBe('Downloading audio');
+  });
+
+  it('leaves progress and timing untouched', () => {
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'Downloading audio' });
+    registry.progress(job.id, 'download', 0.3);
+    const renamed = registry.relabel(job.id, 'Title');
+    expect(renamed?.progress).toEqual({ stage: 'download', fraction: 0.3 });
+    expect(renamed?.startedAt).not.toBeNull();
+  });
+
+  it('does nothing for an unknown job', () => {
+    expect(new JobRegistry().relabel('missing', 'x')).toBeUndefined();
+  });
+});

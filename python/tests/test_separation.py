@@ -39,12 +39,38 @@ class TestStageProgress:
         assert sum(weight for _name, weight in STAGE_WEIGHTS) == pytest.approx(1.0)
 
     def test_maps_stage_fractions_onto_the_overall_bar(self):
+        weights = dict(STAGE_WEIGHTS)
         seen: list[float] = []
         progress = _StageProgress(lambda _s, f: seen.append(f))
         progress.report("decode", 1.0)
         progress.report("separate", 0.5)
-        assert seen[0] == pytest.approx(0.06)
-        assert seen[1] == pytest.approx(0.06 + 0.74 * 0.5)
+        assert seen[0] == pytest.approx(weights["decode"])
+        assert seen[1] == pytest.approx(weights["decode"] + weights["separate"] * 0.5)
+
+    def test_every_stage_starts_where_the_previous_one_ended(self):
+        """No gaps and no overlaps, so the bar cannot jump or stall."""
+        progress = _StageProgress(None)
+        cursor = 0.0
+        for name, weight in STAGE_WEIGHTS:
+            base, mapped = progress._offsets[name]
+            assert base == pytest.approx(cursor)
+            assert mapped == pytest.approx(weight)
+            cursor += weight
+
+    def test_the_end_of_separation_is_distinguishable_from_the_start_of_writing(self):
+        """The reason ``collect`` exists.
+
+        With separation running straight into stem writing, both boundaries
+        landed on the same fraction, so a bar frozen there could mean the
+        model was still finishing or that it had finished and the first
+        stem was being written. Those are different faults and they must
+        not look the same.
+        """
+        seen: list[tuple[str, float]] = []
+        progress = _StageProgress(lambda s, f: seen.append((s, f)))
+        progress.report("separate", 1.0)
+        progress.report("write", 0.0)
+        assert seen[0][1] < seen[1][1]
 
     def test_never_moves_backwards(self):
         seen: list[float] = []

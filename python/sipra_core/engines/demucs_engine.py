@@ -27,6 +27,7 @@ import numpy as np
 
 from ..errors import CancelledError, ErrorCode, SipraError
 from ..stems import FOUR_STEM_SET, SIX_STEM_SET
+from ..trace import Throttle, trace
 from .base import (
     CancellationToken,
     ModelInfo,
@@ -207,6 +208,12 @@ class DemucsEngine:
         noise = io.StringIO()
         try:
             with redirect_stdout(noise):
+                # Constructing the Separator is where model weights are
+                # fetched the first time a model is used — up to a few
+                # hundred megabytes, with its progress bar swallowed by the
+                # redirect above. Without this line that download is a
+                # silent multi-minute pause at the start of separation.
+                trace("loading the model", model=model_id, device=device)
                 separator = demucs.api.Separator(
                     model=model_id,
                     device=device,
@@ -218,10 +225,12 @@ class DemucsEngine:
                     progress=False,
                     callback=reporter.callback,
                 )
+                trace("model ready")
                 wav = torch.from_numpy(np.ascontiguousarray(audio))
                 _origin, separated = separator.separate_tensor(
                     wav, sr=int(request.sample_rate)
                 )
+                trace("model run finished", segments=reporter.calls)
                 model_sample_rate = int(getattr(separator, "samplerate", DEMUCS_SAMPLE_RATE))
         except CancelledError:
             raise
@@ -251,11 +260,20 @@ class DemucsEngine:
 
         wanted = set(request.stems) if request.stems else None
         out: dict[str, np.ndarray] = {}
-        for source_name, tensor in separated.items():
+
+        # Moving each source off the compute device is real work — on CUDA
+        # it is a device-to-host copy of tens of megabytes per stem — and
+        # it used to happen with the bar frozen on the last separation
+        # update. It reports as its own stage now.
+        names = list(separated.keys())
+        for index, source_name in enumerate(names):
+            tensor = separated[source_name]
             stem_id = DEMUCS_SOURCE_TO_STEM.get(source_name, source_name)
-            if wanted is not None and stem_id not in wanted:
-                continue
-            out[stem_id] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+            if wanted is None or stem_id in wanted:
+                trace("collecting", stem=stem_id)
+                out[stem_id] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+            if on_progress:
+                on_progress("collect", (index + 1) / max(1, len(names)))
 
         if not out:
             raise SipraError(
@@ -295,13 +313,16 @@ class _ProgressReporter:
         self._on_progress = on_progress
         self._token = token
         self._last = 0.0
+        self._throttle = Throttle(5.0)
+        #: How many times Demucs has called back. A separation that appears
+        #: frozen but whose count is still climbing is working, not stuck.
+        self.calls = 0
 
     def callback(self, payload: dict[str, Any]) -> None:
         if self._token is not None and self._token.cancelled:
             # demucs.api treats a raised exception as an abort signal.
             raise CancelledError()
-        if self._on_progress is None:
-            return
+        self.calls += 1
         try:
             models = max(1, int(payload.get("models", 1) or 1))
             index = int(payload.get("model_idx_in_bag", 0) or 0)
@@ -310,6 +331,21 @@ class _ProgressReporter:
             within = (offset / length) if length > 0 else 0.0
             fraction = (index + min(max(within, 0.0), 1.0)) / models
         except Exception:  # pragma: no cover - never let progress break a job
+            return
+
+        # The heartbeat. The bar stops at the last segment of the last
+        # model while the model is still running it, so "the bar is not
+        # moving" and "nothing is happening" look identical from outside.
+        # These lines separate them: if they keep arriving, it is working.
+        if self._throttle.ready():
+            trace(
+                "separating",
+                model=f"{index + 1}/{models}",
+                at=f"{fraction * 100:.1f}%",
+                calls=self.calls,
+            )
+
+        if self._on_progress is None:
             return
         fraction = min(max(fraction, 0.0), 0.999)
         if fraction > self._last:

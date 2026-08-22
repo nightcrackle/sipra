@@ -1183,6 +1183,14 @@ button:disabled {
   text-align: right;
 }
 
+/* Elapsed time. Fixed width so a ticking clock does not shift the row. */
+.job__elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  width: 56px;
+  text-align: right;
+}
+
 .job__error {
   color: var(--danger);
   font-size: 12px;

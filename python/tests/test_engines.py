@@ -223,6 +223,33 @@ class TestProgressReporter:
         with pytest.raises(CancelledError):
             reporter.callback({"models": 1, "model_idx_in_bag": 0, "audio_length": 1, "segment_offset": 0})
 
+    def test_counts_every_callback_even_once_the_bar_has_stopped_moving(self):
+        """The heartbeat's evidence.
+
+        The reported fraction is capped just under one and never moves
+        backwards, so the last stretch of a separation produces callbacks
+        that change nothing visible. The count is what shows the model is
+        still running rather than hung.
+        """
+        from sipra_core.engines.demucs_engine import _ProgressReporter
+
+        seen: list[float] = []
+        reporter = _ProgressReporter(lambda _s, f: seen.append(f), None)
+        for _ in range(10):
+            reporter.callback(
+                {"models": 1, "model_idx_in_bag": 0, "audio_length": 100, "segment_offset": 100}
+            )
+        assert reporter.calls == 10
+        # One visible update, ten proofs of life.
+        assert len(seen) == 1
+
+    def test_counts_callbacks_even_with_no_progress_handler(self):
+        from sipra_core.engines.demucs_engine import _ProgressReporter
+
+        reporter = _ProgressReporter(None, None)
+        reporter.callback({"models": 1, "model_idx_in_bag": 0, "audio_length": 100, "segment_offset": 10})
+        assert reporter.calls == 1
+
 
 class TestFriendlyFailure:
     def test_translates_a_cuda_out_of_memory_error(self):

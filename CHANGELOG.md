@@ -12,6 +12,84 @@ real hardware.
 
 ---
 
+## [0.9.4] — 2026-08-22
+
+A separation that sits at 80% showing "Downloading audio". Four releases
+have now shipped a fix for a job that appears frozen, and each one was a
+hypothesis about a machine none of them could see. This release stops
+guessing and builds the instrument instead: the app now keeps a record of
+what it was doing and when, and the progress bar is made capable of
+distinguishing the states it was conflating.
+
+### Added
+
+- **A diagnostic log**, always on, at `%APPDATA%\Sipra\logs\sipra.log`,
+  rotating at 2 MB and keeping three copies. Every job event, every stage
+  change, the duration of every call to the audio engine, and everything
+  the Python side writes to its error stream. Reachable from a "Log"
+  button on any job running longer than two minutes and from "Show the
+  log" on an import failure. It is written to disk and nowhere else —
+  `PRIVACY.md` says exactly what it contains.
+- **A heartbeat for a job that is not moving.** Every 30 seconds a running
+  job that has not changed writes a line saying how long it has been that
+  way. A stall used to be a gap in the record, and a gap looks the same as
+  the app having been closed; it is now a measurement.
+- **Elapsed time next to each running job.** Separating a song on a CPU
+  legitimately takes minutes. "Stuck" and "busy" were indistinguishable
+  without a clock.
+- **A heartbeat inside the model run.** Demucs' progress callback is now
+  counted and sampled to the log every five seconds. The bar necessarily
+  stops moving before the last segment finishes; these lines say whether
+  the model is still working while it does.
+
+### Fixed
+
+- **The end of separation and the start of stem writing were the same
+  number.** Both landed on exactly 0.80, so a bar frozen at 80% could mean
+  the model was still finishing or that it had finished and the first stem
+  was being written — different faults, one appearance. Moving each
+  separated source off the compute device is now its own reported stage,
+  `collect`, with the source resample given a band of its own inside it.
+  Each of those steps now stalls at a different number.
+- **A YouTube import's separation reported into a bar it did not own.**
+  The download filled the first 30%, then separation reported its own
+  0-100% into the same bar — and since the bar never moves backwards, it
+  stood completely still until separation passed the one-third mark. On a
+  slow machine that is minutes of a motionless bar with nothing wrong. The
+  two halves are now scaled against one shared constant.
+- **An import kept the label "Downloading audio" through separation**,
+  which is how a job busy separating stems came to be reported as
+  downloading. It takes the track's title once the download has produced
+  one.
+- **`formatElapsed` rendered `NaN:NaN`** for a job with no start time.
+  Caught by its own test before it reached anything.
+
+### Changed
+
+- Stage tracing in the Python core is on by default rather than opt-in.
+  It was off in packaged builds — the only place a stall has ever been
+  reported — so the mechanism built to explain one was inert exactly where
+  it was needed. `SIPRA_TRACE_STAGES=0` silences it.
+- Each trace line carries the gap since the previous line, so the step
+  that consumed the time is the one with a large number in front of it.
+
+### Tests
+
+- 605 TypeScript tests, 462 Python tests. New coverage for the log
+  (rotation, partial-line streaming, throttling, the heartbeat's
+  measurement of a stall, and every way the logger can fail without
+  taking the app with it), for the download-to-separation handover
+  including a counter-example that reproduces the old motionless bar, and
+  for the callback counter that proves a model run is alive.
+
+### Still unresolved
+
+The cause of the original stall is not known, and this release does not
+claim to fix it. What it changes is that the next occurrence leaves
+evidence.
+
+---
+
 ## [0.9.3] — 2026-08-22
 
 The YouTube import still hung, now at "Checking the downloader — 1%".

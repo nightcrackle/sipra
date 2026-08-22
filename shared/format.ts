@@ -142,6 +142,25 @@ export function formatEstimate(seconds: number): string {
   return `about ${hours} hour${hours === 1 ? '' : 's'}`;
 }
 
+/**
+ * Elapsed wall time for a running job, as `m:ss` or `h:mm:ss`.
+ *
+ * A bar that has not moved is only alarming in proportion to how long it
+ * has not moved for. "Stuck" and "busy" look identical without this, which
+ * is how a separation doing exactly what it should be doing gets reported
+ * as frozen.
+ */
+export function formatElapsed(ms: number): string {
+  // `Math.max(0, NaN)` is NaN, so the guard has to come first — a job
+  // whose start time is missing would otherwise render "NaN:NaN".
+  const total = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  const pad = (value: number): string => (value < 10 ? `0${value}` : String(value));
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
+}
+
 /** Trim a long file name for a fixed-width row, keeping the extension. */
 export function truncateMiddle(text: string, max = 40): string {
   if (text.length <= max) return text;

@@ -1,4 +1,6 @@
-import { formatPercent } from '@shared/format';
+import { useEffect, useState } from 'react';
+
+import { formatElapsed, formatPercent } from '@shared/format';
 import type { Job } from '@shared/types';
 
 import { CloseIcon } from './Icons';
@@ -12,6 +14,7 @@ const STAGE_LABELS: Record<string, string> = {
   decode: 'Reading the file',
   download: 'Downloading',
   separate: 'Separating stems',
+  collect: 'Collecting the stems',
   write: 'Writing stems',
   peaks: 'Drawing waveforms',
   analyse: 'Measuring tempo, key and loudness',
@@ -24,6 +27,15 @@ const STAGE_LABELS: Record<string, string> = {
 function stageLabel(job: Job): string {
   return STAGE_LABELS[job.progress.stage] ?? job.progress.stage;
 }
+
+/**
+ * How long a job runs before the log is offered alongside it.
+ *
+ * Separating a full song on a CPU legitimately takes many minutes, so this
+ * is not a warning — it is the point at which someone might reasonably
+ * want to see what the app is actually doing.
+ */
+const SLOW_JOB_MS = 120_000;
 
 /**
  * A strip of running jobs.
@@ -40,6 +52,19 @@ export function JobsPanel(): JSX.Element | null {
   const visible = jobs.filter(
     (job) => job.status === 'queued' || job.status === 'running' || job.status === 'failed',
   );
+  const anyRunning = visible.some((job) => job.status === 'running');
+
+  // A clock, only while something is running. The elapsed time has to tick
+  // on its own: a job that has genuinely stopped sends no more updates, so
+  // a counter driven by job events would freeze at exactly the moment its
+  // reading became interesting.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!anyRunning) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [anyRunning]);
+
   if (visible.length === 0) return null;
 
   return (
@@ -47,6 +72,11 @@ export function JobsPanel(): JSX.Element | null {
       {visible.map((job) => {
         const running = job.status === 'queued' || job.status === 'running';
         const indeterminate = job.status === 'running' && job.progress.fraction <= 0;
+        // Offered when there is something to explain: a failure, or a job
+        // that has been going long enough for the user to start wondering.
+        const showLogButton =
+          job.status === 'failed' ||
+          (job.status === 'running' && now - (job.startedAt ?? job.createdAt) > SLOW_JOB_MS);
         return (
           <div className="job" key={job.id}>
             <span className="job__label" title={job.label}>
@@ -83,8 +113,24 @@ export function JobsPanel(): JSX.Element | null {
                 <span className="job__pct tabular">
                   {indeterminate ? '—' : formatPercent(job.progress.fraction)}
                 </span>
+                {job.status === 'running' ? (
+                  <span className="job__elapsed tabular muted" title="Time spent on this job">
+                    {formatElapsed(now - (job.startedAt ?? job.createdAt))}
+                  </span>
+                ) : null}
               </>
             )}
+
+            {showLogButton ? (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                onClick={() => void window.sipra.logs.reveal()}
+                title="Open the folder holding Sipra's diagnostic log"
+              >
+                Log
+              </button>
+            ) : null}
 
             {running ? (
               <button

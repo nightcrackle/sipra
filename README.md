@@ -124,6 +124,23 @@ exactly three times, all of them visible and optional:
 There is no telemetry, no analytics, no crash reporting and no account.
 [`PRIVACY.md`](PRIVACY.md) has the detail.
 
+## When something looks stuck
+
+Separating a full song on a CPU takes minutes, not seconds, and the
+elapsed time next to a job is there so you can tell a long step from a
+stopped one. If you want to know exactly what it is doing, the "Log"
+button on a job that has been running a while — and "Show the log" on any
+import error — opens `%APPDATA%\Sipra\logs\`. Every stage is timestamped
+and every gap is measured, so the last line before a pause names the step
+that did not finish. The log stays on your machine; see
+[`PRIVACY.md`](PRIVACY.md).
+
+To check the URL downloader on its own, without the app:
+
+```bash
+python -m sipra_core ytdlp-check
+```
+
 ## Developing
 
 ```bash

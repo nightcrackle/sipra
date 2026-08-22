@@ -87,6 +87,11 @@ const api: SipraApi = {
     set: (patch) => ipcRenderer.invoke(CHANNELS.settingsSet, patch),
   },
 
+  logs: {
+    reveal: () => ipcRenderer.invoke(CHANNELS.logsReveal),
+    read: () => ipcRenderer.invoke(CHANNELS.logsRead),
+  },
+
   notices: {
     on: (listener) => subscribe(EVENTS.notice, listener),
   },

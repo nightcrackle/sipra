@@ -8,6 +8,7 @@
  */
 
 import { app, BrowserWindow, Menu, nativeImage, net, protocol, shell } from 'electron';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -15,6 +16,7 @@ import { MEDIA_SCHEME } from '../shared/ipc';
 import { registerIpc } from './ipc/register';
 import { JobRegistry } from './services/jobs';
 import { LibraryService } from './services/library';
+import { createJobLogger, DiagnosticLog, HEARTBEAT_INTERVAL_MS } from './services/logger';
 import { MediaRequestError, parseMediaUrl, resolveMediaPath } from './services/media';
 import { RuntimeManager } from './services/runtime';
 import { SettingsService } from './services/settings';
@@ -50,10 +52,12 @@ interface Services {
   jobs: JobRegistry;
   sidecar: Sidecar;
   runtime: RuntimeManager;
+  log: DiagnosticLog;
 }
 
 let mainWindow: BrowserWindow | null = null;
 let services: Services | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
 
 function resourcePath(...segments: string[]): string {
   // Packaged: resources sit next to the asar. Development: repo root.
@@ -64,6 +68,21 @@ function resourcePath(...segments: string[]): string {
 function buildServices(): Services {
   const workspaceRoot = path.join(app.getPath('userData'), 'workspace');
   const layout = workspaceLayout(workspaceRoot);
+
+  const log = new DiagnosticLog({ dir: path.join(app.getPath('userData'), 'logs') });
+  log.info('app', '─'.repeat(40));
+  log.info('app', `Sipra ${app.getVersion()} starting`, {
+    electron: process.versions.electron,
+    node: process.versions.node,
+    chrome: process.versions.chrome,
+    platform: `${process.platform} ${process.arch}`,
+    release: os.release(),
+    cpus: os.cpus().length,
+    totalMemoryGb: Math.round((os.totalmem() / 1024 ** 3) * 10) / 10,
+    freeMemoryGb: Math.round((os.freemem() / 1024 ** 3) * 10) / 10,
+    packaged: app.isPackaged,
+    userData: app.getPath('userData'),
+  });
 
   const settings = new SettingsService(layout.settingsFile);
   const library = new LibraryService(layout.libraryFile, workspaceRoot);
@@ -85,18 +104,37 @@ function buildServices(): Services {
     env: {
       SIPRA_BIN_DIR: binDir,
       SIPRA_FFMPEG: path.join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
-      // Stage tracing is cheap and makes a stalled job locatable. On in
-      // development always; in a packaged build only if asked for.
-      SIPRA_TRACE_STAGES: process.env.SIPRA_TRACE_STAGES ?? (isDev ? '1' : '0'),
+      // On unconditionally. It costs a handful of stderr lines per job and
+      // it is the difference between a stalled job that can be located and
+      // one that can only be described. Previously this was off in
+      // packaged builds, which is the only place stalls were reported.
+      SIPRA_TRACE_STAGES: process.env.SIPRA_TRACE_STAGES ?? '1',
     },
     onStderr: (chunk) => {
-      // Always surfaced, not just in development: when a user reports a
-      // job that appears frozen, this is the record of where it stopped.
-      process.stderr.write(`[sidecar] ${chunk}`);
+      // The sidecar's trace lines. In a packaged Windows build there is no
+      // console attached, so process.stderr goes nowhere — the log file is
+      // the only place these survive.
+      log.stream('sidecar', chunk);
+      if (isDev) process.stderr.write(`[sidecar] ${chunk}`);
+    },
+    onTrace: (trace) => {
+      if (trace.phase === 'sent') {
+        log.debug('rpc', `→ ${trace.method}`, { id: trace.id });
+      } else {
+        log.log(trace.outcome === 'ok' ? 'debug' : 'warn', 'rpc', `← ${trace.method} ${trace.outcome}`, {
+          id: trace.id,
+          durationMs: trace.durationMs,
+          ...(trace.error ? { error: trace.error } : {}),
+        });
+      }
     },
   });
 
-  return { settings, library, jobs, sidecar, runtime };
+  sidecar.on('exit', ({ code, signal, expected }: { code: number | null; signal: string | null; expected: boolean }) => {
+    log.log(expected ? 'info' : 'error', 'sidecar', 'exited', { code, signal, expected });
+  });
+
+  return { settings, library, jobs, sidecar, runtime, log };
 }
 
 function registerMediaProtocol(library: LibraryService, workspaceRoot: string): void {
@@ -244,6 +282,18 @@ if (!gotLock) {
       isDev,
     });
 
+    // Every job event goes to the log, progress throttled to one line a
+    // second. The heartbeat then restates any running job that has not
+    // changed, so a stall reads as "still at 80%, unchanged for 14
+    // minutes" rather than as an unexplained gap in the file.
+    const jobLog = createJobLogger(services.log);
+    services.jobs.on('updated', jobLog.onJob);
+    heartbeatTimer = setInterval(() => {
+      if (services) jobLog.heartbeat(services.jobs.active());
+    }, HEARTBEAT_INTERVAL_MS);
+    // Never hold the event loop open on the app's way out.
+    heartbeatTimer.unref?.();
+
     // Housekeeping that must not delay the first paint.
     void services.library.pruneExpiredTrash().catch(() => undefined);
     void services.runtime.detect().catch(() => undefined);
@@ -258,6 +308,8 @@ if (!gotLock) {
   });
 
   app.on('before-quit', () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    services?.log.info('app', 'quitting');
     void services?.sidecar.stop();
   });
 }

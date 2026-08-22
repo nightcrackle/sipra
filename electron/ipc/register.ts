@@ -29,11 +29,13 @@ import type {
 import { pickTrackPatch } from './sanitise';
 import type { JobRegistry } from '../services/jobs';
 import type { LibraryService } from '../services/library';
+import type { DiagnosticLog } from '../services/logger';
 import { resolveMediaPath } from '../services/media';
 import type { RuntimeManager } from '../services/runtime';
 import type { SettingsService } from '../services/settings';
 import { LONG_REQUEST_TIMEOUT_MS, type Sidecar, SidecarError } from '../services/sidecar';
 import {
+  DOWNLOAD_SHARE,
   stemsForPreset,
   WorkspaceService,
   workspaceLayout,
@@ -45,6 +47,7 @@ export interface IpcContext {
   jobs: JobRegistry;
   sidecar: Sidecar;
   runtime: RuntimeManager;
+  log: DiagnosticLog;
   getWindow: () => BrowserWindow | null;
   resourcePath: (...segments: string[]) => string;
   workspaceRoot: string;
@@ -110,7 +113,7 @@ function handle(channel: string, handler: (...args: unknown[]) => Promise<unknow
 }
 
 export function registerIpc(context: IpcContext): void {
-  const { settings, library, jobs, sidecar, runtime, getWindow } = context;
+  const { settings, library, jobs, sidecar, runtime, log, getWindow } = context;
   const layout = workspaceLayout(context.workspaceRoot);
   const workspace = new WorkspaceService(layout, sidecar, library, jobs);
 
@@ -549,7 +552,7 @@ export function registerIpc(context: IpcContext): void {
       const forward = (data: unknown): void => {
         const payload = data as { jobId?: string; stage?: string; fraction?: number };
         if (payload?.jobId === job.id) {
-          jobs.progress(job.id, payload.stage ?? 'download', (payload.fraction ?? 0) * 0.3);
+          jobs.progress(job.id, payload.stage ?? 'download', (payload.fraction ?? 0) * DOWNLOAD_SHARE);
         }
       };
       sidecar.on('progress', forward);
@@ -565,6 +568,7 @@ export function registerIpc(context: IpcContext): void {
           LONG_REQUEST_TIMEOUT_MS,
         );
         sidecar.off('progress', forward);
+        jobs.relabel(job.id, media.title || 'Imported audio');
 
         const currentSettings = await settings.get();
         const track = await workspace.importAndSeparate({
@@ -576,6 +580,9 @@ export function registerIpc(context: IpcContext): void {
           },
           settings: currentSettings,
           jobId: job.id,
+          // The download already spent the first slice of the bar.
+          progressFrom: DOWNLOAD_SHARE,
+          progressTo: 1,
         });
         // The download is only a staging copy; the workspace holds the
         // canonical source from here on.
@@ -611,6 +618,18 @@ export function registerIpc(context: IpcContext): void {
     }
     return settings.set(patch as Partial<Settings>);
   });
+
+  handle(CHANNELS.logsReveal, async () => {
+    // showItemInFolder highlights the file itself rather than just opening
+    // the directory, so the right one is obvious among the rotated copies.
+    shell.showItemInFolder(log.filePath);
+    return true;
+  });
+
+  handle(CHANNELS.logsRead, async () => ({
+    path: log.filePath,
+    text: log.tail(),
+  }));
 }
 
 async function fileExists(target: string): Promise<boolean> {

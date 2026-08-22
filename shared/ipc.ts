@@ -61,6 +61,9 @@ export const CHANNELS = {
 
   settingsGet: 'settings:get',
   settingsSet: 'settings:set',
+
+  logsReveal: 'logs:reveal',
+  logsRead: 'logs:read',
 } as const;
 
 export const EVENTS = {
@@ -193,9 +196,21 @@ export interface SipraApi {
     set(patch: Partial<Settings>): Promise<Settings>;
   };
 
+  logs: {
+    /** Open the folder holding the diagnostic log in the file manager. */
+    reveal(): Promise<boolean>;
+    /** The tail of the log, for copying into a bug report. */
+    read(): Promise<LogReport>;
+  };
+
   notices: {
     on(listener: (notice: Notice) => void): () => void;
   };
+}
+
+export interface LogReport {
+  path: string;
+  text: string;
 }
 
 declare global {

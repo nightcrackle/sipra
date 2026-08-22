@@ -91,6 +91,21 @@ export class JobRegistry extends EventEmitter {
   }
 
   /**
+   * Rename a running job.
+   *
+   * A YouTube import starts before its title is known, so it is created as
+   * "Downloading audio" — and kept that name through separation, which is
+   * how a job that was busy separating stems came to be reported as
+   * "Downloading audio ... Separating stems". Once the title is known the
+   * job says what it is working on.
+   */
+  relabel(jobId: string, label: string): Job | undefined {
+    const trimmed = label.trim();
+    if (!trimmed) return this.jobs.get(jobId);
+    return this.patch(jobId, { label: trimmed });
+  }
+
+  /**
    * Record progress.
    *
    * Progress on a finished job is ignored: a late event arriving after
