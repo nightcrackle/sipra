@@ -12,6 +12,99 @@ real hardware.
 
 ---
 
+## [0.9.3] — 2026-08-22
+
+The YouTube import still hung, now at "Checking the downloader — 1%".
+That is `yt-dlp --version` — a call that answers in milliseconds from a
+terminal. Since 0.9.1 hung on `--dump-single-json` and 0.9.2 hung on
+`--version`, the hang follows the *first invocation of the binary*
+whatever it is asked to do, which points at how the process is spawned
+rather than what it is asked for.
+
+### Fixed
+
+- **Child processes inherited the sidecar's stdin.** None of the five
+  places Sipra spawns a child — yt-dlp metadata, preflight, download,
+  ffprobe, ffmpeg — set `stdin`. On Windows a child with no `stdin`
+  argument inherits the parent's, and the sidecar's stdin is the NDJSON
+  protocol pipe from Electron: a pipe that stays open for the life of the
+  app and only ever carries request lines. A child that reads it steals
+  protocol bytes; a child that blocks on it waits forever for input that
+  is never coming. yt-dlp spawns ffmpeg, which reads stdin for keyboard
+  commands unless told otherwise, so the inheritance reaches two processes
+  deep. Every spawn site now passes `stdin=subprocess.DEVNULL`.
+- **A user's yt-dlp config file could change what Sipra ran.**
+  `%APPDATA%\yt-dlp\config` is read by default, and an option there —
+  `--wait-for-video`, an interactive `--cookies-from-browser`, a proxy —
+  applies to Sipra's invocations too, invisibly. All invocations now pass
+  `--ignore-config`, so what Sipra runs is what Sipra asked for.
+
+### Added
+
+- **`python -m sipra_core ytdlp-check`.** Probes the downloader from a
+  terminal and prints what it found, so the check can be run outside the
+  app when the app is the thing that appears stuck.
+- **A faster downloader diagnosis.** "Check the downloader" in the import
+  dialog now probes directly with a 25-second ceiling instead of going
+  through the cached preflight, so the diagnosis answers quickly even when
+  the preflight is the call that hangs.
+- **`SIPRA_TRACE_STAGES=1`** logs each separation stage as it is entered,
+  for narrowing down a stall that only happens on one machine.
+
+### Tests
+
+- A static test walks every `.py` in the package, extracts the argument
+  list of every `subprocess.run`/`Popen` call, and fails if any of them
+  omits `stdin`. A new spawn site cannot regress this quietly.
+- A fake downloader that calls `sys.stdin.read()` before answering
+  `--version`. It hangs the pre-0.9.3 spawn and passes now.
+
+### Changed
+
+- Per-call timeout overrides: `SIPRA_YTDLP_METADATA_TIMEOUT`,
+  `SIPRA_YTDLP_PREFLIGHT_TIMEOUT`, `SIPRA_YTDLP_DIAGNOSE_TIMEOUT`,
+  `SIPRA_YTDLP_DOWNLOAD_TIMEOUT`.
+- The hint list shown with a downloader failure now leads with "run the
+  downloader yourself from a terminal" — the one check that separates a
+  Sipra problem from a machine problem.
+
+---
+
+## [0.9.2] — 2026-08-22
+
+A YouTube import that showed "Downloading audio — Waiting — 0%" and never
+moved. Three distinct causes, found by following that one symptom.
+
+### Fixed
+
+- **A running job rendered with its queued label.** `JobRegistry.start`
+  set the status to `running` but left `progress.stage` as `queued`, and
+  the panel labels from the stage. So a job that was actively working
+  displayed "Waiting" at 0% — indistinguishable from stuck. The stage now
+  advances when the job starts, and an already-reported stage is left
+  alone.
+- **Nothing was reported before a download began.** `download_audio` runs
+  a preflight and a metadata request first, both of which can take a while
+  on a cold machine, and emitted no progress for either. Those phases now
+  report as "Checking the downloader" and "Reading the link".
+- **A deadlock in the download reader.** stdout was read to EOF while
+  stderr sat unread. Once yt-dlp had written a pipe buffer's worth of
+  warnings — about 64 KB, which it reaches easily — it blocked writing,
+  while Sipra was blocked reading stdout. Nothing timed out, because the
+  `wait()` carrying the timeout was never reached. stderr is now drained
+  on its own thread. The regression test floods 512 KB and is verified to
+  hang the old read pattern.
+
+### Changed
+
+- A running job with nothing to report yet shows a moving bar rather than
+  a flat 0%, which reads as progress rather than as a stall. It respects
+  `prefers-reduced-motion`.
+- The download timeout message now names the limit and carries yt-dlp's
+  stderr instead of saying only "The download timed out."
+
+---
+
 ## [0.9.1] — 2026-08-22
 
 Both fixes here came from the first real run on Windows. Neither had test
@@ -287,6 +380,7 @@ Project started.
 - Demucs is archived upstream. The engine interface exists so a
   replacement can be dropped in without touching the interface.
 
+[0.9.2]: https://github.com/OWNER/sipra/releases/tag/v0.9.2
 [0.9.1]: https://github.com/OWNER/sipra/releases/tag/v0.9.1
 [0.9.0]: https://github.com/OWNER/sipra/releases/tag/v0.9.0
 [0.8.0]: https://github.com/OWNER/sipra/releases/tag/v0.8.0

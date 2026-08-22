@@ -6,6 +6,9 @@ import { useStore } from '../state/store';
 
 const STAGE_LABELS: Record<string, string> = {
   queued: 'Waiting',
+  starting: 'Starting',
+  prepare: 'Checking the downloader',
+  metadata: 'Reading the link',
   decode: 'Reading the file',
   download: 'Downloading',
   separate: 'Separating stems',
@@ -43,6 +46,7 @@ export function JobsPanel(): JSX.Element | null {
     <section className="jobs" aria-label="Background jobs">
       {visible.map((job) => {
         const running = job.status === 'queued' || job.status === 'running';
+        const indeterminate = job.status === 'running' && job.progress.fraction <= 0;
         return (
           <div className="job" key={job.id}>
             <span className="job__label" title={job.label}>
@@ -59,12 +63,26 @@ export function JobsPanel(): JSX.Element | null {
                   {stageLabel(job)}
                 </span>
                 <div className="job__bar">
+                  {/*
+                    A running job that has not reported a number yet gets a
+                    moving bar rather than an empty one. Some stages are
+                    genuinely long before they can report anything, and a
+                    flat 0% there is indistinguishable from stuck.
+                  */}
                   <div
-                    className={`job__fill${job.status === 'succeeded' ? ' is-done' : ''}`}
-                    style={{ width: `${Math.round(job.progress.fraction * 100)}%` }}
+                    className={`job__fill${job.status === 'succeeded' ? ' is-done' : ''}${
+                      indeterminate ? ' is-indeterminate' : ''
+                    }`}
+                    style={
+                      indeterminate
+                        ? undefined
+                        : { width: `${Math.round(job.progress.fraction * 100)}%` }
+                    }
                   />
                 </div>
-                <span className="job__pct tabular">{formatPercent(job.progress.fraction)}</span>
+                <span className="job__pct tabular">
+                  {indeterminate ? '—' : formatPercent(job.progress.fraction)}
+                </span>
               </>
             )}
 

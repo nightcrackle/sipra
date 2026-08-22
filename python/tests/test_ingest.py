@@ -610,3 +610,228 @@ class TestDiagnose:
         fake_ytdlp(monkeypatch, tmp_path, request=_FakeProc(0, b"dQw4w9WgXcQ\n"))
         report = youtube.diagnose()
         assert report["timeouts"]["metadataSeconds"] > 60
+
+
+# A stand-in for yt-dlp. Answers --version, --dump-single-json and a real
+# download, and can be told to flood stderr.
+_FAKE_YTDLP = '''#!{python}
+import json, os, re, sys, time
+
+args = sys.argv[1:]
+
+if "--version" in args:
+    print("2025.01.01")
+    sys.exit(0)
+
+if "--dump-single-json" in args:
+    print(json.dumps({{
+        "title": "Fake Track",
+        "duration": 12,
+        "uploader": "Nobody",
+        "webpage_url": args[-1],
+    }}))
+    sys.exit(0)
+
+# Download. Optionally flood stderr first.
+flood = int(os.environ.get("FAKE_STDERR_BYTES", "0"))
+if flood:
+    written = 0
+    while written < flood:
+        line = "WARNING: something noisy happened " + "x" * 100
+        print(line, file=sys.stderr)
+        written += len(line) + 1
+    sys.stderr.flush()
+
+for percent in (0.0, 25.0, 50.0, 75.0, 100.0):
+    print("[download] {{:5.1f}}% of 1.00MiB".format(percent))
+    sys.stdout.flush()
+
+output = args[args.index("--output") + 1]
+target = re.sub(r"\\.%\\(ext\\)s$", ".wav", output)
+os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+with open(target, "wb") as handle:
+    handle.write(b"RIFF____WAVEfmt ")
+sys.exit(0)
+'''
+
+
+def install_fake_ytdlp(monkeypatch, tmp_path, stderr_bytes: int = 0):
+    """Write an executable fake yt-dlp and point Sipra at it."""
+    import stat
+    import sys as _sys
+
+    script = tmp_path / "fake-yt-dlp.py"
+    script.write_text(_FAKE_YTDLP.format(python=_sys.executable))
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("SIPRA_YTDLP", str(script))
+    monkeypatch.setenv("FAKE_STDERR_BYTES", str(stderr_bytes))
+    return script
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="the fake downloader relies on a shebang",
+)
+class TestDownloadAgainstAFakeDownloader:
+    def test_downloads_and_reports_progress_through_every_phase(self, monkeypatch, tmp_path):
+        install_fake_ytdlp(monkeypatch, tmp_path)
+        seen: list[tuple[str, float]] = []
+
+        media = youtube.download_audio(
+            "https://youtu.be/dQw4w9WgXcQ",
+            tmp_path / "out",
+            rights_confirmed=True,
+            on_progress=lambda stage, fraction: seen.append((stage, fraction)),
+        )
+
+        assert media.path.exists()
+        assert media.title == "Fake Track"
+
+        stages = [stage for stage, _fraction in seen]
+        # The phases before the transfer used to be silent, which left the
+        # job sitting at 0% for as long as they took.
+        assert "prepare" in stages
+        assert "metadata" in stages
+        assert "download" in stages
+        assert seen[-1] == ("download", 1.0)
+
+    def test_progress_is_reported_before_the_transfer_starts(self, monkeypatch, tmp_path):
+        install_fake_ytdlp(monkeypatch, tmp_path)
+        seen: list[str] = []
+        youtube.download_audio(
+            "https://youtu.be/dQw4w9WgXcQ",
+            tmp_path / "out",
+            rights_confirmed=True,
+            on_progress=lambda stage, _fraction: seen.append(stage),
+        )
+        assert seen[0] == "prepare"
+        assert seen.index("metadata") < seen.index("download")
+
+    def test_a_downloader_that_floods_stderr_does_not_deadlock(self, monkeypatch, tmp_path):
+        """Regression: stdout was read to EOF while stderr sat unread. Once
+        yt-dlp had written a pipe buffer's worth of warnings it blocked,
+        and it blocked while we were blocked reading stdout — a permanent
+        hang that no timeout could break, because the wait() carrying the
+        timeout was never reached."""
+        install_fake_ytdlp(monkeypatch, tmp_path, stderr_bytes=512 * 1024)
+
+        media = youtube.download_audio(
+            "https://youtu.be/dQw4w9WgXcQ",
+            tmp_path / "out",
+            rights_confirmed=True,
+        )
+        assert media.path.exists()
+
+    def test_a_failing_progress_callback_cannot_sink_the_download(self, monkeypatch, tmp_path):
+        install_fake_ytdlp(monkeypatch, tmp_path)
+
+        def explode(_stage: str, _fraction: float) -> None:
+            raise RuntimeError("progress handler blew up")
+
+        media = youtube.download_audio(
+            "https://youtu.be/dQw4w9WgXcQ",
+            tmp_path / "out",
+            rights_confirmed=True,
+            on_progress=explode,
+        )
+        assert media.path.exists()
+
+
+class TestChildProcessIsolation:
+    """Every process Sipra spawns must be cut off from the sidecar's stdin.
+
+    Ours is the NDJSON protocol pipe from Electron. A child that reads it
+    steals bytes meant for the sidecar; a child that blocks on it waits
+    forever for input that is never coming. yt-dlp spawns ffmpeg, which
+    reads stdin for keyboard commands unless told otherwise, so the
+    inheritance reaches two processes deep.
+    """
+
+    def test_no_spawn_anywhere_in_the_package_inherits_stdin(self):
+        import re
+        from pathlib import Path
+
+        import sipra_core
+
+        root = Path(sipra_core.__file__).parent
+        offenders: list[str] = []
+
+        for source in root.rglob("*.py"):
+            text = source.read_text(encoding="utf-8")
+            for match in re.finditer(r"subprocess\.(run|Popen)\(", text):
+                # Take the call's argument list by balancing brackets.
+                start = match.end()
+                depth = 1
+                index = start
+                while index < len(text) and depth:
+                    if text[index] == "(":
+                        depth += 1
+                    elif text[index] == ")":
+                        depth -= 1
+                    index += 1
+                call = text[start:index]
+                if "stdin=" not in call:
+                    line = text[: match.start()].count("\n") + 1
+                    offenders.append(f"{source.relative_to(root)}:{line}")
+
+        assert not offenders, (
+            "these spawns inherit the sidecar's stdin: " + ", ".join(offenders)
+        )
+
+
+_STDIN_READER = '''#!{python}
+import sys
+if "--version" in sys.argv:
+    # Block on stdin before answering. With stdin inherited from the
+    # sidecar this never returns; with DEVNULL it reads EOF at once.
+    sys.stdin.read()
+    print("2025.01.01")
+    sys.exit(0)
+sys.stdin.read()
+print("[download] 100.0% of 1.00MiB")
+sys.exit(0)
+'''
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="the fake downloader relies on a shebang",
+)
+def test_a_downloader_that_reads_stdin_still_completes(monkeypatch, tmp_path):
+    """Regression: the preflight hung on `yt-dlp --version`.
+
+    Whatever the arguments were, the first invocation of the binary was
+    where it stopped — which pointed at how it was spawned rather than at
+    what it was asked to do.
+    """
+    import stat
+    import sys as _sys
+
+    script = tmp_path / "stdin-reader.py"
+    script.write_text(_STDIN_READER.format(python=_sys.executable))
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("SIPRA_YTDLP", str(script))
+    youtube.reset_ready_cache()
+
+    # Would hang forever if stdin were inherited from a pipe with no writer.
+    assert youtube.ensure_ready() == "2025.01.01"
+
+
+class TestDeterministicInvocation:
+    def test_a_user_config_file_cannot_change_what_sipra_runs(self):
+        """A yt-dlp.conf anywhere on the machine is read by default."""
+        assert "--ignore-config" in youtube._network_args()
+
+    def test_the_preflight_also_ignores_config(self, monkeypatch, tmp_path):
+        seen: list[list[str]] = []
+        fake = tmp_path / "yt-dlp"
+        fake.write_text("#!/bin/sh\n")
+        monkeypatch.setenv("SIPRA_YTDLP", str(fake))
+
+        def _run(args, **_kwargs):
+            seen.append(list(args))
+            return _FakeProc(0, b"2025.01.01")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        youtube.ensure_ready()
+        assert "--ignore-config" in seen[0]

@@ -24,6 +24,34 @@ describe('JobRegistry', () => {
     expect(started?.startedAt).not.toBeNull();
   });
 
+  it('moves the stage off queued when it starts', () => {
+    // Regression: `start` set status to running but left the stage as
+    // `queued`, so a job that was actively working rendered with the
+    // queued label — "Waiting" at 0%, indistinguishable from stuck.
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'Downloading audio' });
+    expect(job.progress.stage).toBe('queued');
+
+    const started = registry.start(job.id);
+    expect(started?.status).toBe('running');
+    expect(started?.progress.stage).not.toBe('queued');
+    expect(started?.progress.stage).toBe('starting');
+  });
+
+  it('accepts a caller-supplied starting stage', () => {
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'download', label: 'x' });
+    expect(registry.start(job.id, 'prepare')?.progress.stage).toBe('prepare');
+  });
+
+  it('does not overwrite a stage that has already been reported', () => {
+    const registry = new JobRegistry();
+    const job = registry.create({ kind: 'separate', label: 'x' });
+    registry.progress(job.id, 'separate', 0.5);
+    const restarted = registry.start(job.id);
+    expect(restarted?.progress).toEqual({ stage: 'separate', fraction: 0.5 });
+  });
+
   it('records progress', () => {
     const registry = new JobRegistry();
     const job = registry.create({ kind: 'separate', label: 'x' });

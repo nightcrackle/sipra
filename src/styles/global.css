@@ -1146,6 +1146,29 @@ button:disabled {
   transition: width 200ms ease;
 }
 
+.job__fill.is-indeterminate {
+  width: 35%;
+  animation: job-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes job-sweep {
+  0% {
+    margin-left: -35%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job__fill.is-indeterminate {
+    animation: none;
+    margin-left: 0;
+    opacity: 0.5;
+    width: 100%;
+  }
+}
+
 .job__fill.is-failed {
   background: var(--danger);
 }

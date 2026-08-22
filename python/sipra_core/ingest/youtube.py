@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,11 @@ METADATA_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_METADATA_TIMEOUT", 120
 
 # One-off cost of unpacking the bundle and starting the interpreter.
 PREFLIGHT_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_PREFLIGHT_TIMEOUT", 180)
+
+# The diagnostic gets a much shorter ceiling than the operations it is
+# diagnosing. A check that hangs for three minutes tells the user nothing
+# they did not already know.
+DIAGNOSE_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_DIAGNOSE_TIMEOUT", 25)
 
 # Bound yt-dlp's own network waits. Without these it will sit on a
 # half-open socket until *our* timeout fires, which turns a routing problem
@@ -206,6 +212,8 @@ _READY_CACHE: dict[str, str] = {}
 def _hint_lines() -> list[str]:
     """Things that actually fix a hanging yt-dlp, in rough order."""
     return [
+        "Run the downloader yourself from a terminal — if it hangs there too, "
+        "the problem is the binary or the machine, not Sipra.",
         "Check the machine is online and can reach youtube.com in a browser.",
         "If you are behind a proxy or VPN, yt-dlp needs it too "
         "(set HTTPS_PROXY in the environment).",
@@ -220,6 +228,10 @@ def _hint_lines() -> list[str]:
 def _network_args() -> list[str]:
     """Flags that stop yt-dlp waiting forever on a dead connection."""
     args = [
+        # A yt-dlp.conf anywhere on the machine is read by default and can
+        # contain anything, including options that make it wait. Sipra
+        # needs deterministic behaviour, not the user's shell defaults.
+        "--ignore-config",
         "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
         "--retries", str(NETWORK_RETRIES),
         "--no-color",
@@ -244,6 +256,13 @@ def _run_ytdlp(
             capture_output=True,
             check=False,
             timeout=timeout,
+            # Never let a child inherit our stdin. Ours is the NDJSON pipe
+            # from Electron: a child that reads it steals protocol bytes,
+            # and a child that blocks on it waits forever for input that is
+            # never coming. yt-dlp spawns ffmpeg, which reads stdin for
+            # keyboard commands unless told not to, so this inheritance
+            # reaches two processes deep.
+            stdin=subprocess.DEVNULL,
             creationflags=_creation_flags(),
         )
     except subprocess.TimeoutExpired as exc:
@@ -287,7 +306,9 @@ def ensure_ready() -> str:
     if cached is not None:
         return cached
 
-    proc = _run_ytdlp(exe, ["--version"], PREFLIGHT_TIMEOUT_SECONDS, "starting up")
+    proc = _run_ytdlp(
+        exe, ["--ignore-config", "--version"], PREFLIGHT_TIMEOUT_SECONDS, "starting up"
+    )
     if proc.returncode != 0:
         raise SipraError(
             ErrorCode.DOWNLOADER_UNAVAILABLE,
@@ -322,6 +343,7 @@ def diagnose() -> dict:
         "hints": [],
         "forcedIpv4": os.environ.get("SIPRA_YTDLP_FORCE_IPV4") == "1",
         "timeouts": {
+            "diagnoseSeconds": DIAGNOSE_TIMEOUT_SECONDS,
             "preflightSeconds": PREFLIGHT_TIMEOUT_SECONDS,
             "metadataSeconds": METADATA_TIMEOUT_SECONDS,
             "downloadSeconds": DOWNLOAD_TIMEOUT_SECONDS,
@@ -331,8 +353,21 @@ def diagnose() -> dict:
         report["error"] = "yt-dlp is not available in this build of Sipra."
         return report
 
+    # Probe directly rather than through `ensure_ready`, so the check
+    # answers quickly even when the thing being checked is what hangs.
     try:
-        report["version"] = ensure_ready()
+        proc = _run_ytdlp(
+            exe, ["--ignore-config", "--version"], DIAGNOSE_TIMEOUT_SECONDS, "starting up"
+        )
+        if proc.returncode != 0:
+            report["error"] = (
+                "yt-dlp is present but would not run. " + _decode(proc.stderr)[-400:]
+            )
+            report["hints"] = _hint_lines()
+            return report
+        report["version"] = (
+            _decode(proc.stdout).strip().splitlines()[0] if proc.stdout else "unknown"
+        )
     except SipraError as exc:
         report["error"] = exc.message
         report["hints"] = list(exc.details.get("hints") or _hint_lines())
@@ -344,7 +379,7 @@ def diagnose() -> dict:
             exe,
             [*_network_args(), "--no-playlist", "--skip-download", "--print", "id",
              "--", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-            METADATA_TIMEOUT_SECONDS,
+            DIAGNOSE_TIMEOUT_SECONDS,
             "checking the connection to YouTube",
         )
         report["canReachYoutube"] = proc.returncode == 0
@@ -451,12 +486,27 @@ def download_audio(
         )
     _reject_unusable_url(url)
 
+    def report(stage: str, fraction: float) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(stage, fraction)
+            except Exception:  # pragma: no cover - progress must not fail a job
+                pass
+
+    # Everything before the transfer starts is silent otherwise, and on a
+    # first run that silence can last minutes: the preflight unpacks the
+    # yt-dlp bundle and the metadata call is a second round trip. A job
+    # sitting at 0% with no stage name reads as hung.
     exe = _require_ytdlp()
+    report("prepare", 0.02)
     ensure_ready()
+
     dest = Path(destination_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
+    report("metadata", 0.06)
     meta = fetch_metadata(url)
+    report("metadata", 0.1)
     duration = meta.get("durationSeconds")
     if isinstance(duration, (int, float)) and duration > MAX_DURATION_SECONDS:
         raise SipraError(
@@ -486,9 +536,11 @@ def download_audio(
     if ffmpeg_dir:
         cmd[1:1] = ["--ffmpeg-location", ffmpeg_dir]
 
-    stderr_tail: list[str] = []
+    report("download", 0.0)
+    stderr_lines: list[str] = []
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -496,6 +548,29 @@ def download_audio(
         errors="replace",
         creationflags=_creation_flags(),
     )
+
+    # Drain stderr on its own thread.
+    #
+    # Reading stdout to EOF while stderr is an unread pipe is a deadlock
+    # waiting to happen: once yt-dlp has written a pipe buffer's worth of
+    # warnings (~64 KB) it blocks, and it blocks while we are blocked
+    # reading stdout. Nothing times out, because the wait() that carries
+    # the timeout is never reached. yt-dlp is chatty enough on stderr for
+    # this to be reachable rather than theoretical.
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line.rstrip())
+                if len(stderr_lines) > 200:
+                    del stderr_lines[:100]
+        except Exception:  # pragma: no cover - stream closed under us
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, name="yt-dlp-stderr", daemon=True)
+    stderr_thread.start()
+
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -503,9 +578,9 @@ def download_audio(
                 proc.kill()
                 raise CancelledError("Download cancelled")
             match = _PROGRESS_PATTERN.search(line)
-            if match and on_progress:
+            if match:
                 try:
-                    on_progress("download", min(float(match.group(1)) / 100.0, 0.999))
+                    report("download", min(float(match.group(1)) / 100.0, 0.999))
                 except ValueError:  # pragma: no cover
                     pass
         proc.wait(timeout=DOWNLOAD_TIMEOUT_SECONDS)
@@ -514,14 +589,18 @@ def download_audio(
     except subprocess.TimeoutExpired as exc:
         proc.kill()
         raise SipraError(
-            ErrorCode.DOWNLOAD_FAILED, "The download timed out."
+            ErrorCode.DOWNLOAD_FAILED,
+            f"The download did not finish within {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes.",
+            {"stderr": "\n".join(stderr_lines)[-600:], "hints": _hint_lines()},
         ) from exc
     finally:
-        if proc.stderr is not None:
-            stderr_tail = proc.stderr.read().splitlines()[-12:]
-            proc.stderr.close()
+        stderr_thread.join(timeout=5)
         if proc.stdout is not None:
             proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+    stderr_tail = stderr_lines[-12:]
 
     if proc.returncode != 0:
         stderr = "\n".join(stderr_tail)
@@ -539,8 +618,7 @@ def download_audio(
             {"expected": str(target)},
         )
 
-    if on_progress:
-        on_progress("download", 1.0)
+    report("download", 1.0)
 
     return RemoteMedia(
         path=produced,

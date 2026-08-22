@@ -213,7 +213,12 @@ def _load_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
         "-",
     ]
     proc = subprocess.run(
-        cmd, capture_output=True, check=False, creationflags=_creation_flags()
+        cmd,
+        capture_output=True,
+        check=False,
+        # Never inherit the sidecar's stdin; see ingest/youtube.py.
+        stdin=subprocess.DEVNULL,
+        creationflags=_creation_flags(),
     )
     if proc.returncode != 0 or not proc.stdout:
         raise SipraError(
@@ -254,6 +259,7 @@ def _ffprobe_stream(ffmpeg_exe: str, path: Path) -> dict:
             ],
             capture_output=True,
             check=False,
+            stdin=subprocess.DEVNULL,
             creationflags=_creation_flags(),
         )
         parts = proc.stdout.decode("utf-8", "replace").strip().split(",")

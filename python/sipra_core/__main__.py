@@ -97,6 +97,28 @@ def _cmd_separate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ytdlp_check(args: argparse.Namespace) -> int:
+    """Report on the downloader without needing the app to be running.
+
+    The app-side check lives in the import dialog, but if a job is already
+    wedged that is an awkward place to reach it from. This is the same
+    report from a terminal, and it is what a bug report should carry.
+    """
+    from .ingest import youtube
+
+    report = youtube.diagnose()
+    print(json.dumps(report, indent=2, default=str))
+
+    if report.get("canReachYoutube"):
+        return 0
+    if report.get("error"):
+        print("", file=sys.stderr)
+        print(f"Problem: {report['error']}", file=sys.stderr)
+        for hint in report.get("hints") or []:
+            print(f"  - {hint}", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sipra_core", description="Sipra audio core: separation and analysis"
@@ -125,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     separate.add_argument("--no-analyse", action="store_true")
     separate.add_argument("-q", "--quiet", action="store_true")
     separate.set_defaults(func=_cmd_separate)
+
+    sub.add_parser(
+        "ytdlp-check",
+        help="Report whether the URL downloader is present, starts and can reach YouTube",
+    ).set_defaults(func=_cmd_ytdlp_check)
 
     return parser
 

@@ -357,6 +357,7 @@ def _encode_mp3(source: Path, target: Path, bitrate: str = "320k") -> None:
         ],
         capture_output=True,
         check=False,
+        stdin=subprocess.DEVNULL,
         creationflags=flags,
     )
     if proc.returncode != 0 or not target.exists():

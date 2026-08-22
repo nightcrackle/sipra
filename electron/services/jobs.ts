@@ -72,8 +72,22 @@ export class JobRegistry extends EventEmitter {
     return this.list().filter((job) => job.status === 'queued' || job.status === 'running');
   }
 
-  start(jobId: string): Job | undefined {
-    return this.patch(jobId, { status: 'running', startedAt: Date.now() });
+  /**
+   * Mark a job running.
+   *
+   * The stage is advanced off `queued` at the same time. Leaving it meant
+   * a job that had started but not yet reported progress still rendered
+   * with the queued label — so a download that was actively preparing
+   * showed as "Waiting" at 0%, which is indistinguishable from stuck.
+   */
+  start(jobId: string, stage = 'starting'): Job | undefined {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+    return this.patch(jobId, {
+      status: 'running',
+      startedAt: job.startedAt ?? Date.now(),
+      progress: job.progress.stage === 'queued' ? { stage, fraction: 0 } : job.progress,
+    });
   }
 
   /**
