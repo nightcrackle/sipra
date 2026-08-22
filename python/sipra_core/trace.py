@@ -55,6 +55,66 @@ def trace(message: str, **fields: object) -> None:
         pass
 
 
+def memory_mb() -> tuple[int, int] | None:
+    """``(available, total)`` system memory in MB, or ``None`` if unknown.
+
+    No dependency: Windows through ``GlobalMemoryStatusEx``, Linux through
+    ``/proc/meminfo``. Recorded at each stage boundary so that a job which
+    slows to a stop can be checked against the machine's memory rather than
+    guessed about. A pipeline stage that measures well under a second in
+    testing and takes minutes on one machine is either doing more work than
+    expected or running out of room, and only one of those leaves a trace.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _Status()
+            status.dwLength = ctypes.sizeof(_Status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return (
+                int(status.ullAvailPhys // (1024 * 1024)),
+                int(status.ullTotalPhys // (1024 * 1024)),
+            )
+
+        available = total = 0
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) // 1024
+                elif line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) // 1024
+                if available and total:
+                    break
+        return (available, total) if total else None
+    except Exception:
+        return None
+
+
+def trace_memory(message: str) -> None:
+    """Trace a line carrying the machine's free memory, if it can be read."""
+    reading = memory_mb()
+    if reading is None:
+        trace(message)
+    else:
+        available, total = reading
+        trace(message, freeMb=available, totalMb=total)
+
+
 class Throttle:
     """Lets an event through at most once every ``interval`` seconds.
 

@@ -135,6 +135,12 @@ and every gap is measured, so the last line before a pause names the step
 that did not finish. The log stays on your machine; see
 [`PRIVACY.md`](PRIVACY.md).
 
+If a job really has stopped, press Cancel. Sipra gives it eight seconds to
+stop on its own and then restarts the audio engine, which is the only
+thing that reclaims a native call that has stopped responding. Your
+library is untouched and the next thing you do starts a fresh engine —
+you should never need to close the application to get out of a stuck job.
+
 To check the URL downloader on its own, without the app:
 
 ```bash

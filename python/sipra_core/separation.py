@@ -27,7 +27,7 @@ from .engines.base import CancellationToken, SeparationRequest
 from .engines.registry import EngineRegistry
 from .errors import ErrorCode, SipraError
 from .stems import sort_stems
-from .trace import trace
+from .trace import trace, trace_memory
 from .waveform import DEFAULT_SAMPLES_PER_BUCKET, compute_peaks, write_peaks
 
 ProgressFn = Callable[[str, float], None]
@@ -253,6 +253,10 @@ def separate_track(
     warnings.extend(result.warnings)
     progress.report("collect", 1.0)
     _log_stage("separated", stems=len(result.stems), rate=result.sample_rate)
+    # The high-water mark of the whole run: the source and every stem are
+    # resident at once here. If a machine is going to run short, this is
+    # where it happens, and this is the line that will say so.
+    trace_memory("memory after separation")
 
     out_rate = result.sample_rate
 
@@ -324,16 +328,23 @@ def separate_track(
         progress.report("write", (index + 1) / total_stems)
 
     # -- source copy and its peaks --------------------------------------
-    _log_stage("writing the source copy and its waveform")
-    progress.report("peaks", 0.2)
+    #
+    # Each step announces itself. Everything from here on is numpy and
+    # scipy work of the same kind as the conversion that once stopped a job
+    # dead, so if that ever happens again the log names which one.
+    progress.report("peaks", 0.1)
     source_path = track_dir / "source.wav"
     if keep_source_copy:
+        _log_stage("writing the source copy")
         write_audio(source_path, source.data, out_rate, subtype=stem_subtype)
+        progress.report("peaks", 0.4)
+    _log_stage("drawing the source waveform")
     source_peaks_path = write_peaks(
         peaks_dir / "source.speaks",
         compute_peaks(source.data, out_rate, DEFAULT_SAMPLES_PER_BUCKET),
     )
     progress.report("peaks", 1.0)
+    _log_stage("source waveform written")
 
     # -- analysis -------------------------------------------------------
     analysis_payload: dict | None = None
@@ -342,6 +353,7 @@ def separate_track(
             token.raise_if_cancelled()
         # The first analysis in a process pays numba's JIT compilation,
         # which can take the better part of a minute on a cold machine.
+        trace_memory("memory before analysis")
         _log_stage("measuring tempo, key and loudness")
         try:
             analysis = analyse_buffer(
@@ -350,8 +362,10 @@ def separate_track(
             )
             analysis_payload = analysis.to_dict()
             warnings.extend(analysis.warnings)
+            _log_stage("analysis finished")
         except Exception as exc:
             warnings.append(f"Analysis failed: {exc}")
+            _log_stage("analysis failed", error=str(exc)[:200])
     progress.report("analyse", 1.0)
 
     device_label = result.device

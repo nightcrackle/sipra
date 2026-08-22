@@ -260,8 +260,11 @@ describeIf('sidecar integration', () => {
     }
   });
 
-  it('reports an unknown job as not cancellable', async () => {
-    expect(await sidecar.cancel('no-such-job')).toBe(false);
+  it('reports an unknown job as already stopped', async () => {
+    // `cancel` answers "is this job still running", not "did the engine
+    // recognise it". Nothing is running under that id, so there is nothing
+    // to wait for and nothing to restart.
+    expect(await sidecar.cancel('no-such-job')).toBe(true);
   });
 
   it('stays responsive to a ping while a job is running', async () => {
@@ -285,3 +288,108 @@ describeIf('sidecar integration', () => {
     await job;
   }, 180_000);
 });
+
+/**
+ * What happens when a job will not stop.
+ *
+ * Cancellation sets a flag the Python side checks between steps. A native
+ * call that has stopped responding — a numpy or scipy routine, which is
+ * what a real stall turned out to be — never reaches a check, so the flag
+ * is never read. Heavy work runs one at a time, so from that moment the
+ * engine is finished for the session: every later separation queues behind
+ * a job that will never end. The only fix is to kill the process, and a
+ * user should not have to be the one who works that out.
+ *
+ * `debug.wedge` stands in for that native call. It exists only when the
+ * fixture engine is enabled, which is never true in a packaged build.
+ */
+describeIf('cancelling a job that will not stop', () => {
+  let workspace: string;
+  let wedged: Sidecar;
+
+  beforeAll(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'sipra-wedge-'));
+    wedged = new Sidecar({
+      pythonPath: python as string,
+      cwd: pythonDir,
+      env: { SIPRA_ENABLE_FIXTURE_ENGINE: '1' },
+      // Shortened so the test does not sit out the real grace period.
+      cancelGraceMs: 1500,
+    });
+    await wedged.start();
+  }, 120_000);
+
+  afterAll(async () => {
+    await wedged?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  it('restarts the engine and leaves it usable', async () => {
+    const restarts: string[] = [];
+    wedged.on('restarting', ({ reason }: { reason: string }) => restarts.push(reason));
+
+    const stuck = wedged.request('debug.wedge', { jobId: 'wedged-job', seconds: 120 }, 300_000);
+    // Let it reach the worker before cancelling.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(wedged.hasPendingFor('wedged-job')).toBe(true);
+
+    const stoppedCleanly = await wedged.cancel('wedged-job');
+    expect(stoppedCleanly).toBe(false);
+    expect(restarts).toHaveLength(1);
+    expect(restarts[0]).toContain('wedged-job');
+
+    // The wedged request is rejected rather than left hanging forever.
+    await expect(stuck).rejects.toMatchObject({ code: 'SIDECAR_RESTARTED' });
+
+    // And the engine works again — which is the whole point. Before this,
+    // one wedged job ended the session.
+    const pong = await wedged.request<{ pong: boolean }>('ping', {}, 60_000);
+    expect(pong.pong).toBe(true);
+  }, 120_000);
+
+  it('runs a real job after a restart', async () => {
+    const outcome = await wedged.request<{ stems: unknown[] }>(
+      'separate',
+      {
+        path: sharedSource(workspace, python as string),
+        outputDir: path.join(workspace, 'after-restart'),
+        engine: 'fixture',
+        model: 'fixture-4',
+        analyse: false,
+        jobId: 'after-restart',
+      },
+      180_000,
+    );
+    expect(outcome.stems).toHaveLength(4);
+  }, 180_000);
+
+  it('does not restart when the job stops on its own', async () => {
+    const restarts: string[] = [];
+    wedged.on('restarting', ({ reason }: { reason: string }) => restarts.push(reason));
+    // Short enough to finish inside the grace period.
+    await wedged.request('debug.wedge', { jobId: 'brief', seconds: 0.2 }, 30_000);
+    expect(await wedged.cancel('brief')).toBe(true);
+    expect(restarts).toHaveLength(0);
+  }, 60_000);
+});
+
+/** Write the shared test signal into `dir` once, returning its path. */
+function sharedSource(dir: string, pythonExe: string): string {
+  const target = path.join(dir, 'signal.wav');
+  execFileSync(
+    pythonExe,
+    [
+      '-c',
+      [
+        'import sys, numpy as np, soundfile as sf',
+        'sr = 44100',
+        't = np.arange(int(sr * 1.5)) / sr',
+        'sig = (0.4*np.sin(2*np.pi*110*t) + 0.3*np.sin(2*np.pi*880*t)).astype("float32")',
+        'sf.write(sys.argv[1], np.stack([sig, sig]).T, sr, subtype="FLOAT")',
+      ].join('\n'),
+      target,
+    ],
+    { cwd: pythonDir },
+  );
+  return target;
+}

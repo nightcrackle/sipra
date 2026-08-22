@@ -129,6 +129,17 @@ export function registerIpc(context: IpcContext): void {
   library.on('warning', (notice: Notice) => notify(notice));
   jobs.on('updated', (job: Job) => send(EVENTS.jobUpdated, job));
 
+  sidecar.on('restarting', ({ reason }: { reason: string }) => {
+    log.warn('sidecar', 'restarting', { reason });
+    notify({
+      level: 'warning',
+      title: 'Audio engine restarted',
+      message:
+        'A job would not stop, so the audio engine was restarted. Nothing else was lost — ' +
+        'your library is intact and the next thing you do will start it again.',
+    });
+  });
+
   sidecar.on('exit', ({ expected }: { expected: boolean }) => {
     if (expected) return;
     notify({
@@ -436,9 +447,14 @@ export function registerIpc(context: IpcContext): void {
 
   handle(CHANNELS.jobsCancel, async (jobId) => {
     const id = requireString(jobId, 'jobId');
-    const cancelled = await sidecar.cancel(id);
+    // Marked cancelled first. Whether the engine stops cleanly or has to
+    // be restarted, the job is over from the user's point of view, and
+    // leaving the row spinning while we wait out the grace period would
+    // suggest Cancel had not worked.
     jobs.cancel(id);
-    return cancelled;
+    const stopped = await sidecar.cancel(id);
+    log.info('job', `${id} cancel requested`, { stoppedCleanly: stopped });
+    return stopped;
   });
 
   // -- files -----------------------------------------------------------

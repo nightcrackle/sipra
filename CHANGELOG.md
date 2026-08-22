@@ -12,6 +12,57 @@ real hardware.
 
 ---
 
+## [0.9.6] — 2026-08-22
+
+"I had to kill it." That answer matters more than the stall it described.
+Cancel was there, and it did not work — so the fault was not only that a
+job stopped, it was that stopping a job required ending the session. This
+release makes Cancel able to stop something that has stopped listening.
+
+### Fixed
+
+- **Cancel could not stop a wedged job, and the engine never recovered
+  from one.** Cancelling sets a flag the Python side checks between steps.
+  A native call that has stopped responding — a numpy or scipy routine,
+  which is what the reported stall turned out to be — never reaches a
+  check, so the flag is never read. Heavy work runs one at a time by
+  design, so from that moment every later separation queued behind a job
+  that would never end, and the only way out was to kill the application.
+  Cancel now waits eight seconds for the job to actually stop and, failing
+  that, kills and restarts the engine. Requests in flight are rejected
+  with a clear reason rather than left hanging, the library is untouched,
+  and the next action starts a fresh engine.
+- **A deliberately killed request reported itself as a crash.** It now
+  says it was restarted, and why — in the log and in what the user is
+  shown.
+
+### Added
+
+- **Free memory recorded at the two points it could matter**: immediately
+  after separation, which is the high-water mark of the whole run, and
+  before analysis. Read through Windows' own memory API and Linux's
+  `/proc/meminfo`, no new dependency. The memory-pressure explanation for
+  the 0.9.5 stall was a guess; the next log either supports it or kills it.
+- **Every remaining numpy and scipy step announces itself** — the source
+  copy, the source waveform, analysis start and finish. Everything after
+  separation is the same kind of work as the call that hung, so if it
+  happens again the log names which one rather than going quiet.
+- **A notice when the engine is restarted**, so a job vanishing has a
+  stated reason instead of looking like lost work.
+
+### Tests
+
+- 608 TypeScript tests, 474 Python tests. The wedged-job case is now
+  reproducible: a test-only `debug.wedge` method occupies the worker while
+  ignoring cancellation — registered only when the fixture engine is
+  enabled, which never happens in a packaged build. The integration test
+  drives a real sidecar over a real pipe: it wedges a job, cancels it,
+  and asserts the engine restarts, the wedged request is rejected rather
+  than abandoned, and a real separation runs afterwards. Plus the
+  counter-case: a job that stops on its own must not trigger a restart.
+
+---
+
 ## [0.9.5] — 2026-08-22
 
 The log from 0.9.4 named the step. The last line before the stall was

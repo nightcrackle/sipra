@@ -49,7 +49,21 @@ interface Pending {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
   method: string;
+  /** The job this request belongs to, so a cancel can tell whether it worked. */
+  jobId?: string;
 }
+
+/**
+ * How long a cancel waits for the engine to actually stop.
+ *
+ * Cancelling sets a flag that the Python side checks between steps. A
+ * wedged native call — a numpy or scipy routine that has stopped making
+ * progress — never reaches a check, so the flag is never read, the job
+ * never ends, and because heavy work runs one at a time the engine is
+ * finished for the rest of the session. Past this grace period the process
+ * is killed instead, which is the only thing that reclaims a native call.
+ */
+export const CANCEL_GRACE_MS = 8_000;
 
 /**
  * One line in the request trace.
@@ -74,6 +88,8 @@ export interface SidecarOptions {
   env?: Record<string, string | undefined>;
   onStderr?: (text: string) => void;
   onTrace?: (trace: SidecarTrace) => void;
+  /** Override the cancel grace period. Tests use a short one. */
+  cancelGraceMs?: number;
 }
 
 export class Sidecar extends EventEmitter {
@@ -83,6 +99,8 @@ export class Sidecar extends EventEmitter {
   private starting: Promise<void> | null = null;
   private ready = false;
   private stopping = false;
+  /** Set while a deliberate restart is in flight, so the exit can say why. */
+  private restartReason: string | null = null;
   private stderrTail: string[] = [];
 
   constructor(private options: SidecarOptions) {
@@ -204,18 +222,28 @@ export class Sidecar extends EventEmitter {
         this.ready = false;
         this.child = null;
         const wasExpected = this.stopping;
+        // A deliberate restart says so. Left as "stopped", a request
+        // killed on purpose was indistinguishable from a crash — in the
+        // log and in whatever the user was shown.
+        const restarted = this.restartReason;
         this.failAll(
-          new SidecarError({
-            code: 'SIDECAR_EXITED',
-            message: wasExpected
-              ? 'The audio engine was stopped.'
-              : 'The audio engine stopped unexpectedly.',
-            details: {
-              code,
-              signal,
-              stderr: this.stderrTail.join('').slice(-1500),
-            },
-          }),
+          restarted
+            ? new SidecarError({
+                code: 'SIDECAR_RESTARTED',
+                message: 'The audio engine was restarted because it stopped responding.',
+                details: { reason: restarted, code, signal },
+              })
+            : new SidecarError({
+                code: 'SIDECAR_EXITED',
+                message: wasExpected
+                  ? 'The audio engine was stopped.'
+                  : 'The audio engine stopped unexpectedly.',
+                details: {
+                  code,
+                  signal,
+                  stderr: this.stderrTail.join('').slice(-1500),
+                },
+              }),
         );
         this.emit('exit', { code, signal, expected: wasExpected });
         if (!wasExpected) {
@@ -339,6 +367,7 @@ export class Sidecar extends EventEmitter {
         },
         timer,
         method,
+        jobId: typeof params.jobId === 'string' ? params.jobId : undefined,
       });
 
       try {
@@ -361,11 +390,91 @@ export class Sidecar extends EventEmitter {
   async cancel(jobId: string): Promise<boolean> {
     if (!this.isReady) return false;
     try {
-      const result = await this.request<{ cancelled: boolean }>('cancel', { jobId }, 15_000);
-      return Boolean(result?.cancelled);
+      await this.request<{ cancelled: boolean }>('cancel', { jobId }, 15_000);
     } catch {
-      return false;
+      // The engine did not even answer the cancel. Fall through: the wait
+      // below decides whether anything is still running.
     }
+    return this.waitForJobToStop(jobId);
+  }
+
+  /** Whether any request for this job is still outstanding. */
+  hasPendingFor(jobId: string): boolean {
+    for (const [, pending] of this.pending) {
+      if (pending.jobId === jobId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Wait for a cancelled job's work to actually finish.
+   *
+   * Returns true if it stopped on its own. If it has not stopped by the
+   * end of the grace period the engine is restarted, because a job that
+   * ignores cancellation is wedged inside a native call, and a wedged
+   * native call holds the only worker there is — every separation after it
+   * would queue behind it forever.
+   */
+  private async waitForJobToStop(jobId: string): Promise<boolean> {
+    const grace = this.options.cancelGraceMs ?? CANCEL_GRACE_MS;
+    const deadline = Date.now() + grace;
+    while (this.hasPendingFor(jobId)) {
+      if (Date.now() >= deadline) {
+        await this.restart(`job ${jobId} did not stop when cancelled`);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return true;
+  }
+
+  /**
+   * Kill the engine and let the next request start a fresh one.
+   *
+   * The only way to reclaim a native call that has stopped responding.
+   * Every request in flight is rejected rather than left hanging, and the
+   * restart is announced so the app can say what happened instead of
+   * appearing to lose a job for no reason.
+   */
+  async restart(reason: string): Promise<void> {
+    const child = this.child;
+    this.emit('restarting', { reason });
+    if (!child) {
+      this.ready = false;
+      return;
+    }
+
+    // Flagged as expected so this does not also raise the "stopped
+    // unexpectedly" alarm — this exit is deliberate.
+    this.stopping = true;
+    this.restartReason = reason;
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Already gone.
+    }
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 3000);
+      child.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
+    this.child = null;
+    this.ready = false;
+    this.stopping = false;
+    // Anything the exit handler did not already reject — the case where
+    // the process never reported its own exit.
+    this.failAll(
+      new SidecarError({
+        code: 'SIDECAR_RESTARTED',
+        message: 'The audio engine was restarted because it stopped responding.',
+        details: { reason },
+      }),
+    );
+    this.restartReason = null;
   }
 
   async stop(): Promise<void> {

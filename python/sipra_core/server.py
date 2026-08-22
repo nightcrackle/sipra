@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -25,7 +26,7 @@ from . import __version__
 from .analysis import analyse_file
 from .audio_io import SUPPORTED_INPUT_EXTENSIONS, ffmpeg_path, load_audio, probe
 from .engines.base import CancellationToken
-from .engines.registry import EngineRegistry
+from .engines.registry import FIXTURE_ENV_FLAG, EngineRegistry
 from .errors import CancelledError, ErrorCode, SipraError
 from .ingest import local as local_ingest
 from .ingest import youtube
@@ -412,6 +413,25 @@ HANDLERS: dict[str, Handler] = {
     "shutdown": _h_shutdown,
 }
 
+
+def _h_wedge(server: SipraServer, request: Request) -> dict:
+    """Occupy the worker for a while, ignoring cancellation.
+
+    A stand-in for the one failure this codebase could not otherwise
+    reproduce: a native call — a numpy or scipy routine — that stops
+    responding. Cancellation sets a flag checked between steps, and a call
+    like that never reaches a check, so the flag is never read. Because
+    heavy work runs one at a time, the engine is then finished for the rest
+    of the session unless something kills the process.
+
+    Registered only when the fixture engine is enabled, which is never the
+    case in a packaged build.
+    """
+    seconds = float(optional(request.params, "seconds", (int, float), 30.0) or 30.0)
+    time.sleep(min(max(seconds, 0.0), 300.0))
+    return {"wedged": True}
+
+
 # Methods dispatched to the background worker.
 ASYNC_METHODS: frozenset[str] = frozenset(
     {
@@ -426,3 +446,12 @@ ASYNC_METHODS: frozenset[str] = frozenset(
         "youtube.diagnose",
     }
 )
+
+
+if os.environ.get(FIXTURE_ENV_FLAG) == "1":
+    # Registered as a pair. Adding the method to ASYNC_METHODS
+    # unconditionally would leave an async method with no handler behind
+    # it, which the dispatch tests reject — rightly, since that is a real
+    # way to ship a method that dispatches into nothing.
+    HANDLERS["debug.wedge"] = _h_wedge
+    ASYNC_METHODS = ASYNC_METHODS | {"debug.wedge"}
