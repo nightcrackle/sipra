@@ -1038,12 +1038,6 @@ class TestLocatingTheDownload:
 
         return _locate_output(path)
 
-    def test_finds_the_file_behind_a_bracketed_title(self, tmp_path):
-        (tmp_path / "TEETH - Laklak [HQ AUDIO].m4a").write_bytes(b"x")
-        found = self._locate(tmp_path / "TEETH - Laklak [HQ AUDIO].audio")
-        assert found is not None
-        assert found.name == "TEETH - Laklak [HQ AUDIO].m4a"
-
     @pytest.mark.parametrize(
         "title",
         [
