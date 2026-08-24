@@ -212,10 +212,55 @@ export function registerIpc(context: IpcContext): void {
 
   handle(CHANNELS.runtimeStatus, async () => runtime.getStatus());
 
+  /**
+   * Fetch and warm the separation model as part of setup.
+   *
+   * Two one-time costs live here: downloading the model's weights, and the
+   * first inference, which is what makes the compute device build its
+   * kernels. Left where they were — inside whichever job happened to be
+   * first — they produced a first track that appeared to stop a few
+   * percent into separation and stay there, with a progress bar that had
+   * no way to describe either. Paying for them during setup, where a slow
+   * step is expected and has a label, is the difference.
+   *
+   * Failure here is not fatal. A machine that cannot reach the network at
+   * setup can still install; the first separation will fetch the weights
+   * itself, as it always did.
+   */
+  const prepareDefaultModel = async (): Promise<void> => {
+    const current = await settings.get();
+    const forward = (data: unknown): void => {
+      const payload = data as { stage?: string; fraction?: number };
+      if (payload?.stage !== 'model') return;
+      runtime.patchStatus({
+        stage: 'preparing-model',
+        message: 'Preparing the separation model. This is a one-time download.',
+        fraction: 0.95 + 0.05 * Math.min(1, Math.max(0, payload.fraction ?? 0)),
+      });
+    };
+    sidecar.on('progress', forward);
+    try {
+      const outcome = await sidecar.request<{ downloaded: boolean; seconds: number }>(
+        'models.prepare',
+        { engine: current.engineId, model: current.modelId, warmup: true },
+        LONG_REQUEST_TIMEOUT_MS,
+      );
+      log.info('runtime', 'model prepared', outcome);
+    } catch (error) {
+      log.warn('runtime', 'model preparation skipped', {
+        error: (error as Error).message,
+      });
+    } finally {
+      sidecar.off('progress', forward);
+    }
+  };
+
   handle(CHANNELS.runtimeInstall, async () => {
     const status = await runtime.install();
     if (status.stage === 'ready' && status.pythonPath) {
       await ensureRuntime().catch(() => undefined);
+      await prepareDefaultModel();
+      runtime.patchStatus({ stage: 'ready', message: 'Audio runtime ready.', fraction: 1 });
     }
     return runtime.getStatus();
   });

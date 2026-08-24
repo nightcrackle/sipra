@@ -5,6 +5,10 @@ release/
 coverage/
 *.tsbuildinfo
 
+# Test reports written by CI for the run summary.
+vitest-report.json
+pytest-report.xml
+
 # Dependencies
 node_modules/
 .pnp

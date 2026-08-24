@@ -1,4 +1,9 @@
-name: CI
+# The TypeScript gate: types, lint, unit tests, and a production build.
+#
+# Split from the Python workflow on purpose. Each has its own badge, so a
+# red mark says which half of the app broke rather than only that
+# something did.
+name: TypeScript
 
 on:
   push:
@@ -11,9 +16,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  typescript:
-    name: TypeScript (${{ matrix.os }})
+  test:
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,15 +40,29 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # Needed by the stem-vocabulary parity test, which compares the
-          # TypeScript and Python definitions by running both.
           python-version: '3.11'
+          cache: pip
 
       - name: Install dependencies
         run: npm ci
         env:
           # The Electron binary is only needed to package, not to test.
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      # Without this the sidecar integration tests skip themselves, and
+      # they are the only tests that exercise the Electron-to-Python
+      # boundary over a real pipe — the boundary where most of this
+      # project's real bugs have been. PyTorch is deliberately not
+      # installed: a fixture engine stands in for it, so this stays a
+      # short install rather than a two-gigabyte one.
+      - name: Install the audio core so the integration tests run
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./python[dev]"
+
+      - name: Confirm the integration tests will not skip
+        working-directory: python
+        run: python -c "import sipra_core, numpy, soundfile, scipy; print('integration tests enabled')"
 
       - name: Type check
         run: npm run typecheck
@@ -49,71 +71,11 @@ jobs:
         run: npm run lint
 
       - name: Test
-        run: npm run test
+        run: npm run test -- --reporter=json --outputFile=vitest-report.json --reporter=default
+
+      - name: Summarise
+        if: always()
+        run: node scripts/test-summary.mjs vitest-report.json "TypeScript (${{ matrix.os }})"
 
       - name: Build renderer and main process
         run: npm run build
-
-  python:
-    name: Python (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-        python-version: ['3.10', '3.11', '3.12']
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install audio core
-        # Deliberately without the `separation` extra: PyTorch is ~2 GB and
-        # the engine contract is covered by a fixture engine instead.
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e "./python[dev]"
-
-      - name: Lint
-        run: python -m ruff check python
-
-      - name: Test
-        run: python -m pytest python -q
-
-  package:
-    name: Package Windows installer
-    runs-on: windows-latest
-    needs: [typescript, python]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Fetch bundled helper binaries
-        run: node scripts/fetch-binaries.mjs
-        env:
-          # Set to 0 to build an installer with no downloader in it.
-          SIPRA_BUNDLE_YTDLP: ${{ vars.SIPRA_BUNDLE_YTDLP || '1' }}
-
-      - name: Build and package
-        run: npm run package
-        env:
-          NODE_ENV: production
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sipra-windows-installer
-          path: release/*.exe
-          if-no-files-found: error

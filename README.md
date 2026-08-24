@@ -8,6 +8,11 @@
 
 No account. No upload. No subscription.
 
+[![TypeScript](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![Python](https://github.com/OWNER/REPO/actions/workflows/python.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/python.yml)
+[![Release](https://github.com/OWNER/REPO/actions/workflows/release.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 </div>
 
 ---
@@ -174,6 +179,40 @@ app — import, progress, workspace, export — without installing PyTorch.
 
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how the pieces fit
 together. [`docs/BUILDING.md`](docs/BUILDING.md) covers packaging.
+
+## Continuous integration
+
+Three workflows, three badges at the top of this file:
+
+| Workflow | What it runs | When |
+| --- | --- | --- |
+| **TypeScript** (`ci.yml`) | typecheck, lint, 633 tests, production build — on Windows and Ubuntu | every push and pull request |
+| **Python** (`python.yml`) | ruff, 487 tests — on Windows and Ubuntu, across Python 3.10, 3.11 and 3.12 | every push and pull request |
+| **Release** (`release.yml`) | the full gate again, then the Windows installer | version tags, or on request |
+
+The TypeScript workflow installs the Python core as well. That is not
+redundant: the sidecar integration tests spawn a real Python process and
+drive it over a real pipe, and without those dependencies present they
+skip themselves silently — which would leave the boundary where most of
+this project's real bugs have been entirely uncovered. PyTorch is
+deliberately not installed anywhere in CI; a fixture engine that splits by
+frequency band stands in for it, so a run takes minutes rather than
+downloading two gigabytes.
+
+Each run writes a one-line pass/fail summary to the GitHub run page, and
+Windows and Ubuntu are reported separately so a platform-specific failure
+is obvious from the badge page.
+
+**Before pushing to GitHub**, point the badges at your repository:
+
+```bash
+npm run set-repo -- your-username/sipra   # or just `npm run set-repo` once origin is set
+```
+
+The badge URLs contain the owner and repository name, so until this is run
+they render as blank images. The script rewrites all of them together —
+editing three URLs by hand and getting one wrong produces a badge that
+stays blank with nothing to indicate why.
 
 ## Built on
 

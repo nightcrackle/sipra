@@ -331,3 +331,87 @@ class TestEngineRegistry:
     def test_fixture_engine_appears_when_the_flag_is_set(self, monkeypatch):
         monkeypatch.setenv("SIPRA_ENABLE_FIXTURE_ENGINE", "1")
         assert "fixture" in [e.id for e in EngineRegistry().all()]
+
+
+class TestStderrRelay:
+    """Relaying Demucs' output as it is produced.
+
+    Demucs and torch.hub write to stdout, which is the protocol channel,
+    so their output has to be diverted. It used to be collected and printed
+    when the call returned — which meant a model download's progress bar
+    appeared only once the download had finished, precisely when nobody
+    needs it. The first run after installing looked frozen because of it.
+    """
+
+    def _relay(self, interval=0.0):
+        from sipra_core.engines.demucs_engine import _StderrRelay
+
+        return _StderrRelay("demucs", interval=interval)
+
+    def test_emits_a_line_as_soon_as_it_is_complete(self, monkeypatch, capsys):
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay()
+        relay.write("downloading 10%\n")
+        assert "downloading 10%" in capsys.readouterr().err
+
+    def test_treats_a_carriage_return_as_a_line_break(self, monkeypatch, capsys):
+        # Progress bars redraw with \r and never emit \n until the end.
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay()
+        relay.write("10%\r20%\r30%\r")
+        err = capsys.readouterr().err
+        assert "10%" in err and "30%" in err
+
+    def test_rate_limits_a_redrawing_progress_bar(self, monkeypatch, capsys):
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay(interval=60.0)
+        for percent in range(0, 100, 5):
+            relay.write(f"{percent}%\r")
+        # One gets through; the rest would bury the log.
+        assert capsys.readouterr().err.count("demucs:") == 1
+
+    def test_holds_a_partial_line_until_it_is_finished(self, monkeypatch, capsys):
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay()
+        relay.write("half a ")
+        assert capsys.readouterr().err == ""
+        relay.write("line\n")
+        assert "half a line" in capsys.readouterr().err
+
+    def test_close_emits_the_remainder_even_when_throttled(self, monkeypatch, capsys):
+        # The last line is the one that says how it ended.
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay(interval=60.0)
+        relay.write("first\n")
+        capsys.readouterr()
+        relay.write("done, no newline")
+        relay.close()
+        assert "done, no newline" in capsys.readouterr().err
+
+    def test_never_writes_to_stdout(self, monkeypatch, capsys):
+        # stdout is the NDJSON protocol channel. A byte here corrupts it.
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay()
+        relay.write("anything\n")
+        assert capsys.readouterr().out == ""
+
+    def test_flushes_a_producer_that_never_ends_a_line(self, monkeypatch, capsys):
+        monkeypatch.setenv("SIPRA_TRACE_STAGES", "1")
+        relay = self._relay()
+        relay.write("x" * 5000)
+        assert "xxxx" in capsys.readouterr().err
+
+    def test_reports_bytes_written_so_it_can_stand_in_for_a_stream(self):
+        relay = self._relay()
+        assert relay.write("four") == 4
+        assert relay.write("") == 0
+
+    def test_looks_enough_like_a_stream_for_redirect_stdout(self):
+        from contextlib import redirect_stdout
+
+        relay = self._relay()
+        with redirect_stdout(relay):
+            print("through the redirect")
+        relay.close()
+        assert relay.isatty() is False
+        assert relay.encoding == "utf-8"

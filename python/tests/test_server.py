@@ -285,3 +285,37 @@ class TestStreamIntegrity:
         send(server, "probe", {"path": str(nasty)})
         assert len(stream.lines) == 1
         assert stream.responses()[0]["ok"] is True
+
+
+class TestPrepareModel:
+    """First-run model preparation.
+
+    The reason this method exists: the weights download and the compute
+    device's cold start used to be paid inside whichever separation
+    happened to run first, where the progress bar had no way to describe
+    either. The first track anyone separated after installing appeared to
+    stop a few percent in and stay there.
+    """
+
+    def test_prepares_the_default_model(self, server, stream):
+        send(server, "models.prepare", {"engine": "fixture"}, req_id="m1")
+        result = stream.wait_for_response("m1")["result"]
+        assert result["prepared"] is True
+        assert result["engine"] == "fixture"
+
+    def test_reports_progress_on_the_model_stage(self, server, stream):
+        send(server, "models.prepare", {"engine": "fixture", "jobId": "setup"}, req_id="m2")
+        stream.wait_for_response("m2")
+        stages = {event["data"]["stage"] for event in stream.events("progress")}
+        assert stages, "preparation must report, or it is the silent wait it replaced"
+        assert stages == {"model"}
+
+    def test_rejects_a_model_the_engine_does_not_have(self, server, stream):
+        send(server, "models.prepare", {"engine": "fixture", "model": "nope"}, req_id="m3")
+        error = stream.wait_for_response("m3")["error"]
+        assert error["code"] == ErrorCode.MODEL_UNAVAILABLE
+
+    def test_runs_on_the_worker_not_the_reader_thread(self):
+        # It downloads weights and runs an inference. On the reader thread
+        # that would block every ping and every cancel for its duration.
+        assert "models.prepare" in ASYNC_METHODS

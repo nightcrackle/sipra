@@ -19,8 +19,9 @@ decoded them via ffmpeg by this point.
 
 from __future__ import annotations
 
-import io
+import time
 from contextlib import redirect_stdout
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -98,6 +99,96 @@ MODELS_BY_ID: dict[str, ModelInfo] = {m.id: m for m in MODELS}
 DEFAULT_MODEL_ID = "htdemucs"
 
 
+def weights_cache_dir() -> Path | None:
+    """Where torch keeps downloaded checkpoints, if torch can say."""
+    try:
+        import torch
+
+        return Path(torch.hub.get_dir()) / "checkpoints"
+    except Exception:
+        return None
+
+
+def weights_are_cached() -> bool:
+    """Whether any model checkpoint is already on disk.
+
+    Used to label the wait, not to decide anything: getting it wrong means
+    the message says "downloading" when it did not need to, which is a
+    great deal better than the silence this replaced.
+    """
+    directory = weights_cache_dir()
+    if directory is None or not directory.is_dir():
+        return False
+    try:
+        return any(entry.suffix in {".th", ".pt", ".ckpt"} for entry in directory.iterdir())
+    except OSError:
+        return False
+
+
+class _StderrRelay:
+    """A stdout stand-in that forwards to stderr as text arrives.
+
+    Demucs and ``torch.hub`` write to stdout, which is the NDJSON protocol
+    channel, so their output has to be diverted. Collecting it and printing
+    it at the end — which is what this replaced — meant a download's
+    progress bar only appeared once the download had finished, which is
+    exactly when nobody needs it.
+
+    Progress bars redraw with carriage returns, so those are treated as
+    line breaks and the result is rate-limited: the useful signal is that
+    the number is still climbing, not every value it takes.
+    """
+
+    def __init__(self, scope: str, interval: float = 2.0) -> None:
+        self._scope = scope
+        self._buffer = ""
+        self._throttle = Throttle(interval)
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        self._buffer += text
+        while True:
+            index = min(
+                (i for i in (self._buffer.find("\n"), self._buffer.find("\r")) if i >= 0),
+                default=-1,
+            )
+            if index < 0:
+                break
+            line, self._buffer = self._buffer[:index], self._buffer[index + 1 :]
+            self._emit(line)
+        # A producer that never terminates a line must not grow this
+        # without bound.
+        if len(self._buffer) > 4096:
+            self._emit(self._buffer)
+            self._buffer = ""
+        return len(text)
+
+    def _emit(self, line: str, *, force: bool = False) -> None:
+        text = line.strip()
+        if not text:
+            return
+        if force or self._throttle.ready():
+            trace(f"{self._scope}: {text}")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        """Emit whatever is left, unthrottled — the last line matters most."""
+        if self._buffer.strip():
+            self._emit(self._buffer, force=True)
+        self._buffer = ""
+
+    # `redirect_stdout` hands this to anything that inspects the stream.
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+
 class DemucsEngine:
     """Separation backed by ``demucs.api``."""
 
@@ -161,6 +252,123 @@ class DemucsEngine:
         except Exception:  # pragma: no cover
             return "CUDA"
 
+    # -- model preparation ----------------------------------------------
+
+    def _build_separator(
+        self,
+        request: SeparationRequest | None,
+        model_id: str,
+        device: str,
+        callback: Any = None,
+    ):
+        """Construct the Demucs separator, fetching weights if needed.
+
+        This is where a first run spends its time. ``demucs.api.Separator``
+        resolves the model, and if the weights are not on disk yet it
+        downloads them — tens to hundreds of megabytes — before returning.
+        Callers report a stage around this so the wait has a name.
+        """
+        import demucs.api
+
+        cached = weights_are_cached()
+        trace(
+            "loading the model",
+            model=model_id,
+            device=device,
+            weights="cached" if cached else "downloading",
+        )
+        started = time.monotonic()
+        separator = demucs.api.Separator(
+            model=model_id,
+            device=device,
+            shifts=max(0, int(request.shifts)) if request else 0,
+            overlap=float(np.clip(request.overlap, 0.0, 0.95)) if request else 0.25,
+            split=True,
+            segment=request.segment if request else None,
+            jobs=max(0, int(request.jobs)) if request else 0,
+            progress=False,
+            callback=callback,
+        )
+        trace("model ready", seconds=round(time.monotonic() - started, 1))
+        return separator
+
+    def prepare_model(
+        self,
+        model_id: str,
+        device: str | None = None,
+        warmup: bool = True,
+        on_progress: ProgressFn | None = None,
+    ) -> dict:
+        """Fetch, load and warm a model so a later job does not have to.
+
+        Two costs are paid here, and both are paid only once. The weights
+        are downloaded, and the first inference makes the compute device
+        build its kernels — on a cold GPU that second part alone can take
+        longer than the download. Doing this during setup is the difference
+        between a first track that behaves like every other one and a first
+        track that appears to stop a few percent into separation.
+        """
+        available, reason = self._check()
+        if not available:
+            raise SipraError(
+                ErrorCode.ENGINE_UNAVAILABLE,
+                reason or "Demucs is not available",
+                {"engine": self.id},
+            )
+        if model_id not in MODELS_BY_ID:
+            raise SipraError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"Unknown Demucs model '{model_id}'",
+                {"available": [m.id for m in MODELS]},
+            )
+
+        import torch
+
+        resolved_device = device or self.devices()[0]
+        had_weights = weights_are_cached()
+        started = time.monotonic()
+
+        if on_progress:
+            on_progress("model", 0.05)
+
+        relay = _StderrRelay("demucs")
+        try:
+            with redirect_stdout(relay):
+                separator = self._build_separator(None, model_id, resolved_device, None)
+                if on_progress:
+                    on_progress("model", 0.6 if warmup else 1.0)
+
+                if warmup:
+                    # Two seconds of silence. Enough to force a real forward
+                    # pass, which is what compiles the device's kernels;
+                    # short enough to cost nothing on a warm one.
+                    trace("warming the model", device=resolved_device)
+                    rate = int(getattr(separator, "samplerate", DEMUCS_SAMPLE_RATE))
+                    silence = torch.zeros(2, rate * 2)
+                    separator.separate_tensor(silence, sr=rate)
+                    trace("model warm")
+        except (RuntimeError, OSError) as exc:
+            raise SipraError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                _friendly_failure(exc, resolved_device),
+                {"model": model_id, "device": resolved_device, "detail": str(exc)[:500]},
+            ) from exc
+        finally:
+            relay.close()
+
+        if on_progress:
+            on_progress("model", 1.0)
+
+        return {
+            "prepared": True,
+            "engine": self.id,
+            "model": model_id,
+            "device": resolved_device,
+            "downloaded": not had_weights,
+            "warmed": bool(warmup),
+            "seconds": round(time.monotonic() - started, 1),
+        }
+
     # -- separation -----------------------------------------------------
 
     def separate(
@@ -189,7 +397,6 @@ class DemucsEngine:
         device = request.device or self.devices()[0]
         warnings: list[str] = []
 
-        import demucs.api
         import torch
 
         audio = np.asarray(request.audio, dtype=np.float32)
@@ -212,28 +419,18 @@ class DemucsEngine:
 
         # Demucs and torch.hub both write to stdout. Stdout is the protocol
         # channel, so anything they emit is diverted to stderr.
-        noise = io.StringIO()
+        # Demucs and torch.hub both write to stdout, and stdout is the
+        # protocol channel. Their output is relayed to stderr as it is
+        # produced rather than collected and printed at the end — the whole
+        # point of seeing a download's progress bar is seeing it while the
+        # download is running.
+        relay = _StderrRelay("demucs")
         try:
-            with redirect_stdout(noise):
-                # Constructing the Separator is where model weights are
-                # fetched the first time a model is used — up to a few
-                # hundred megabytes, with its progress bar swallowed by the
-                # redirect above. Without this line that download is a
-                # silent multi-minute pause at the start of separation.
-                trace("loading the model", model=model_id, device=device)
-                separator = demucs.api.Separator(
-                    model=model_id,
-                    device=device,
-                    shifts=max(0, int(request.shifts)),
-                    overlap=float(np.clip(request.overlap, 0.0, 0.95)),
-                    split=True,
-                    segment=request.segment,
-                    jobs=max(0, int(request.jobs)),
-                    progress=False,
-                    callback=reporter.callback,
-                )
-                trace("model ready")
+            with redirect_stdout(relay):
+                separator = self._build_separator(request, model_id, device, reporter.callback)
                 wav = torch.from_numpy(np.ascontiguousarray(audio))
+                if on_progress:
+                    on_progress("model", 1.0)
                 _origin, separated = separator.separate_tensor(
                     wav, sr=int(request.sample_rate)
                 )
@@ -256,11 +453,7 @@ class DemucsEngine:
                 {"model": model_id, "device": device},
             ) from exc
         finally:
-            leaked = noise.getvalue().strip()
-            if leaked:
-                import sys
-
-                print(leaked, file=sys.stderr)
+            relay.close()
 
         if token is not None:
             token.raise_if_cancelled()

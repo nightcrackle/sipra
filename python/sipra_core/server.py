@@ -395,9 +395,38 @@ def _h_shutdown(server: SipraServer, request: Request) -> dict:
     return {"stopping": True}
 
 
+def _h_prepare_model(server: SipraServer, request: Request) -> dict:
+    """Fetch, load and warm a model ahead of any job that needs it.
+
+    Called during first-run setup. Without it, the first track anyone
+    separates after installing pays for the model download and the compute
+    device's cold start, inside a job whose progress bar cannot describe
+    either — which is why that first track looked like it had stopped a few
+    percent into separation.
+    """
+    engine_id = optional(request.params, "engine", str)
+    model_id = optional(request.params, "model", str)
+    warmup = bool(optional(request.params, "warmup", bool, True))
+    job_id = str(optional(request.params, "jobId", str) or request.id)
+
+    engine, resolved = server.registry.resolve(engine_id, model_id)
+    prepare = getattr(engine, "prepare_model", None)
+    if prepare is None:
+        return {"prepared": False, "engine": engine.id, "model": resolved,
+                "reason": "This engine needs no preparation."}
+
+    return prepare(
+        resolved,
+        device=optional(request.params, "device", str),
+        warmup=warmup,
+        on_progress=server._progress_fn(request.id, job_id),
+    )
+
+
 HANDLERS: dict[str, Handler] = {
     "ping": _h_ping,
     "capabilities": _h_capabilities,
+    "models.prepare": _h_prepare_model,
     "probe": _h_probe,
     "ingest.validate": _h_validate,
     "ingest.import": _h_import,
@@ -444,6 +473,9 @@ ASYNC_METHODS: frozenset[str] = frozenset(
         # Runs yt-dlp twice and may sit on a network timeout, so it must
         # not block the reader thread.
         "youtube.diagnose",
+        # Downloads weights and runs a warm-up inference. Minutes on a cold
+        # machine, so it cannot hold the reader thread.
+        "models.prepare",
     }
 )
 

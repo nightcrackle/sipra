@@ -43,9 +43,18 @@ ProgressFn = Callable[[str, float], None]
 # finished and the first stem was being written — two different bugs with
 # one appearance. The work it names is real: moving each separated tensor
 # off the compute device and back into a numpy array.
+#
+# ``model`` covers fetching and loading the separation model, and the
+# first inference that makes the compute device compile its kernels. On
+# every run after the first this is a second or two. On the first run it
+# is a download of tens of megabytes followed by a cold start, and it used
+# to report nothing at all — so the first track anyone separated after
+# installing appeared to stop dead a few percent into separation. It has
+# its own stage now so the app can say what it is doing.
 STAGE_WEIGHTS: tuple[tuple[str, float], ...] = (
     ("decode", 0.06),
-    ("separate", 0.70),
+    ("model", 0.04),
+    ("separate", 0.66),
     ("collect", 0.04),
     ("write", 0.08),
     ("peaks", 0.06),
@@ -232,8 +241,14 @@ def separate_track(
     def _engine_progress(stage: str, fraction: float) -> None:
         if stage == "collect":
             progress.report("collect", fraction * ENGINE_SHARE_OF_COLLECT)
+        elif stage == "model":
+            progress.report("model", fraction)
         else:
             progress.report("separate", fraction)
+
+    # Entering the stage before the engine does, so the label is right from
+    # the moment the work starts rather than from the engine's first report.
+    progress.report("model", 0.0)
 
     result = engine.separate(
         SeparationRequest(

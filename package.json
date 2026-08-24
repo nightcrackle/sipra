@@ -1,6 +1,6 @@
 {
   "name": "sipra",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "private": true,
   "description": "Local stem separation and a waveform workspace for musicians. Your audio never leaves your computer.",
   "author": "Sipra",
@@ -26,6 +26,7 @@
     "lint:py": "python -m ruff check python",
     "verify": "npm run typecheck && npm run lint && npm run test",
     "icons": "node scripts/make-icons.mjs",
+    "set-repo": "node scripts/set-repo.mjs",
     "package": "npm run build && electron-builder --win",
     "package:dir": "npm run build && electron-builder --win --dir"
   },

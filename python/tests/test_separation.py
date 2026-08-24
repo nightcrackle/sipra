@@ -125,12 +125,21 @@ class TestStageProgress:
 
     def test_maps_stage_fractions_onto_the_overall_bar(self):
         weights = dict(STAGE_WEIGHTS)
+
+        def base_of(stage: str) -> float:
+            total = 0.0
+            for name, weight in STAGE_WEIGHTS:
+                if name == stage:
+                    return total
+                total += weight
+            raise AssertionError(f"no such stage: {stage}")
+
         seen: list[float] = []
         progress = _StageProgress(lambda _s, f: seen.append(f))
         progress.report("decode", 1.0)
         progress.report("separate", 0.5)
         assert seen[0] == pytest.approx(weights["decode"])
-        assert seen[1] == pytest.approx(weights["decode"] + weights["separate"] * 0.5)
+        assert seen[1] == pytest.approx(base_of("separate") + weights["separate"] * 0.5)
 
     def test_every_stage_starts_where_the_previous_one_ended(self):
         """No gaps and no overlaps, so the bar cannot jump or stall."""

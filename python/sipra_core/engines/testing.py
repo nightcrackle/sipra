@@ -74,6 +74,37 @@ class FixtureEngine:
     def describe_device(self, device: str) -> str:
         return "CPU"
 
+    def prepare_model(
+        self,
+        model_id: str,
+        device: str | None = None,
+        warmup: bool = True,
+        on_progress: ProgressFn | None = None,
+    ) -> dict:
+        """Nothing to fetch, but the same shape and the same reports.
+
+        The fixture engine stands in for a real one in the tests that cover
+        first-run preparation, so it has to answer the same question.
+        """
+        if model_id not in MODELS_BY_ID:
+            raise SipraError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"Unknown fixture model '{model_id}'",
+                {"available": list(MODELS_BY_ID)},
+            )
+        if on_progress:
+            on_progress("model", 0.05)
+            on_progress("model", 1.0)
+        return {
+            "prepared": True,
+            "engine": self.id,
+            "model": model_id,
+            "device": device or "cpu",
+            "downloaded": False,
+            "warmed": bool(warmup),
+            "seconds": 0.0,
+        }
+
     def separate(
         self,
         request: SeparationRequest,

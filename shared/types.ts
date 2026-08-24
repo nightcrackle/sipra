@@ -181,6 +181,7 @@ export type RuntimeStage =
   | 'creating-environment'
   | 'installing-packages'
   | 'verifying'
+  | 'preparing-model'
   | 'ready'
   | 'failed';
 

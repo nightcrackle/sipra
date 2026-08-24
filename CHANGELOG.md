@@ -12,6 +12,82 @@ real hardware.
 
 ---
 
+## [0.9.7] — 2026-08-24
+
+Two reports that turned out to be one fault, plus continuous integration.
+
+The first track separated after installing would stop at around 36% and
+stay there. Loading the same track again and cancelling the first one made
+the second finish. Those two facts together are the diagnosis: nothing was
+broken, the first attempt was paying a one-time cost with no way to say
+so, and by the time the second attempt ran that cost had been paid.
+
+36% is where the bar sits when decoding has finished and separation has
+barely started. Two things happen in that gap, both only on a first run:
+the model's weights are downloaded, and the first inference makes the
+compute device compile its kernels. Neither reported anything, and the
+download's own progress bar was captured and printed only after it had
+finished — so the one piece of evidence that something was happening
+appeared exactly when it was no longer needed.
+
+### Fixed
+
+- **The first separation after installing no longer pays for the model.**
+  Setup now fetches the weights and runs a warm-up inference as its last
+  step, with its own labelled progress. The first track behaves like every
+  track after it. If setup cannot reach the network, this is skipped and
+  the first separation fetches the weights as before — a machine that is
+  offline at install time can still install.
+- **Model preparation is a stage with a name.** `model` sits between
+  decoding and separation, so the app says "Preparing the model" instead of
+  showing a number that does not move. Its bar is deliberately
+  indeterminate: the duration genuinely cannot be predicted, and inventing
+  a fraction to look reassuring would be worse than admitting that.
+- **Demucs' own output is relayed as it is produced.** It was collected
+  into a buffer and printed when the call returned. A download's progress
+  bar is worth nothing after the download. Carriage returns are treated as
+  line breaks and the result is rate-limited, so a redrawing progress bar
+  becomes a readable trail in the log rather than either silence or a
+  flood.
+- **Cancelling a stuck job no longer takes a queued job with it.** The
+  workaround in the second report — queue another track, cancel the first
+  — collided with the forced restart added in 0.9.6, which kills
+  everything in flight. A job killed by a restart before it ever reported
+  progress is now retried once. A job that had already reported progress
+  is not: it may have been the wedged one, and re-running it would wedge
+  again.
+
+### Added
+
+- **`models.prepare`**, which fetches, loads and warms a model on request.
+  Used by setup; also available on its own.
+- **Continuous integration in three workflows**, each with its own badge:
+  TypeScript (typecheck, lint, tests, build), Python (ruff and tests
+  across 3.10, 3.11 and 3.12), and Release (the full gate, then the
+  installer). Windows and Ubuntu both, on every push and pull request.
+- **The integration tests now actually run in CI.** They spawn a real
+  Python process and drive it over a real pipe — the boundary where most
+  of this project's real bugs have been — and they had been skipping
+  themselves silently because the workflow never installed the Python
+  core. A step now asserts they are enabled rather than trusting it.
+- **`npm run set-repo`**, which points the badge URLs at a repository.
+  Badge URLs carry the owner and repository name; until they are set they
+  render as blank images with nothing to say why. Editing three by hand
+  and getting one wrong produces exactly that, silently.
+- **A one-line pass/fail summary on each CI run**, from Vitest's JSON
+  report or pytest's JUnit XML.
+
+### Tests
+
+- 633 TypeScript tests, 487 Python tests. New coverage for the output
+  relay (including that it never writes to stdout, which is the protocol
+  channel), for model preparation and its progress reporting, and for both
+  CI scripts — a summary parser that misreads a report would quietly claim
+  a failing run passed, and a badge rewriter that misses a URL leaves a
+  blank image forever.
+
+---
+
 ## [0.9.6] — 2026-08-22
 
 "I had to kill it." That answer matters more than the stall it described.

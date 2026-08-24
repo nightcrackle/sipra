@@ -189,23 +189,45 @@ export class WorkspaceService {
 
     const trackDir = await this.allocateTrackDir(title, trackId);
 
-    const unsubscribe = this.subscribeProgress(jobId, progressFrom, progressTo);
+    let started = false;
+    const unsubscribe = this.subscribeProgress(jobId, progressFrom, progressTo, () => {
+      started = true;
+    });
+    const params = {
+      path: request.path,
+      outputDir: trackDir,
+      engine: request.engineId ?? settings.engineId,
+      model: request.modelId ?? settings.modelId,
+      stems: request.stems ?? null,
+      device: request.device ?? settings.device,
+      analyse: request.analyse ?? settings.autoAnalyse,
+      jobId,
+    };
     let payload: SeparationPayload;
     try {
-      payload = await this.sidecar.request<SeparationPayload>(
-        'separate',
-        {
-          path: request.path,
-          outputDir: trackDir,
-          engine: request.engineId ?? settings.engineId,
-          model: request.modelId ?? settings.modelId,
-          stems: request.stems ?? null,
-          device: request.device ?? settings.device,
-          analyse: request.analyse ?? settings.autoAnalyse,
-          jobId,
-        },
-        LONG_REQUEST_TIMEOUT_MS,
-      );
+      try {
+        payload = await this.sidecar.request<SeparationPayload>(
+          'separate',
+          params,
+          LONG_REQUEST_TIMEOUT_MS,
+        );
+      } catch (error) {
+        // Retried exactly once, and only when this job had not started.
+        //
+        // Cancelling a job that will not stop restarts the engine, and the
+        // restart takes down everything queued behind it. Queueing a
+        // second track and cancelling the first is a natural thing to try
+        // when a job looks stuck, and it should not cost the second track.
+        // A job that had already reported progress is not retried: it may
+        // have been the wedged one, and re-running it would wedge again.
+        const restarted = error instanceof SidecarError && error.code === 'SIDECAR_RESTARTED';
+        if (!restarted || started) throw error;
+        payload = await this.sidecar.request<SeparationPayload>(
+          'separate',
+          params,
+          LONG_REQUEST_TIMEOUT_MS,
+        );
+      }
     } catch (error) {
       // Nothing usable was produced, so leave no half-built directory.
       await fs.rm(trackDir, { recursive: true, force: true }).catch(() => undefined);
@@ -280,10 +302,16 @@ export class WorkspaceService {
    * Events carry the job id, so several jobs can be in flight without
    * their progress crossing over.
    */
-  private subscribeProgress(jobId: string, from = 0, to = 1): () => void {
+  private subscribeProgress(
+    jobId: string,
+    from = 0,
+    to = 1,
+    onFirstReport?: () => void,
+  ): () => void {
     const handler = (data: unknown): void => {
       const payload = data as { jobId?: string; stage?: string; fraction?: number } | undefined;
       if (!payload || payload.jobId !== jobId) return;
+      onFirstReport?.();
       this.jobs.progress(jobId, payload.stage ?? 'working', scaleProgress(payload.fraction, from, to));
     };
     this.sidecar.on('progress', handler);

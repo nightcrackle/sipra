@@ -11,6 +11,9 @@ const STAGE_COPY: Record<RuntimeStatus['stage'], string> = {
   'creating-environment': 'Creating a private Python environment…',
   'installing-packages': 'Downloading the separation engine…',
   verifying: 'Checking the installation…',
+  // Done here rather than inside the first separation, where the same wait
+  // had no label and read as a stalled job.
+  'preparing-model': 'Preparing the separation model…',
   ready: 'Ready.',
   failed: '',
 };

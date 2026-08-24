@@ -13,6 +13,7 @@ const STAGE_LABELS: Record<string, string> = {
   metadata: 'Reading the link',
   decode: 'Reading the file',
   download: 'Downloading',
+  model: 'Preparing the model',
   separate: 'Separating stems',
   collect: 'Collecting the stems',
   write: 'Writing stems',
@@ -36,6 +37,18 @@ function stageLabel(job: Job): string {
  * want to see what the app is actually doing.
  */
 const SLOW_JOB_MS = 120_000;
+
+/**
+ * Stages whose duration genuinely cannot be predicted.
+ *
+ * These get a moving bar rather than a still one. Preparing a model may be
+ * instant or may be a several-hundred-megabyte download followed by a cold
+ * compute device; checking a downloader and reading a link depend on a
+ * remote host. A frozen number through any of them reads as a fault, and
+ * inventing a fraction to avoid that would be worse than admitting the
+ * duration is unknown.
+ */
+const INDETERMINATE_STAGES = new Set(['model', 'prepare', 'metadata', 'starting']);
 
 /**
  * A strip of running jobs.
@@ -71,7 +84,9 @@ export function JobsPanel(): JSX.Element | null {
     <section className="jobs" aria-label="Background jobs">
       {visible.map((job) => {
         const running = job.status === 'queued' || job.status === 'running';
-        const indeterminate = job.status === 'running' && job.progress.fraction <= 0;
+        const indeterminate =
+          job.status === 'running' &&
+          (job.progress.fraction <= 0 || INDETERMINATE_STAGES.has(job.progress.stage));
         // Offered when there is something to explain: a failure, or a job
         // that has been going long enough for the user to start wondering.
         const showLogButton =
