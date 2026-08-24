@@ -24,6 +24,12 @@ waveform workspace where you can solo, mute, loop, balance and export.
 Everything runs locally. Your audio is never uploaded, because there is
 nowhere to upload it to: Sipra has no server and no account system.
 
+!!!!! READ THIS !!!!!
+There is an issue when adding a Music/Track for the first time. For this to work,
+load the first track, and when it stalls, add the same track again and CANCEL the
+first track. The second track and the following future tracks should go smoothly.
+!!!!! READ THIS !!!!!
+
 ## What it actually does well, and what it doesn't
 
 Read this before you decide whether Sipra is useful to you.
