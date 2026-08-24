@@ -80,7 +80,14 @@ def unique_stem(directory: str | Path, stem: str, suffix: str) -> Path:
     normalised = suffix if suffix.startswith(".") else f".{suffix}"
 
     def taken(candidate: str) -> bool:
-        return any(base.glob(f"{candidate}.*"))
+        # Compared literally, not matched with `glob`. A title is user text
+        # and reaches this intact, and `glob` reads `[`, `]`, `*` and `?`
+        # as pattern syntax — so a bracketed title silently reported every
+        # stem as free and this reserved nothing at all.
+        try:
+            return any(entry.stem == candidate for entry in base.iterdir())
+        except OSError:
+            return False
 
     if not taken(stem):
         return base / f"{stem}{normalised}"

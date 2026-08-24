@@ -997,3 +997,113 @@ class TestDownloadFormat:
         source = inspect.getsource(youtube.download_audio)
         assert "DOWNLOAD_POLL_SECONDS" in source
         assert "time.monotonic()" in source
+
+
+class TestLocatingTheDownload:
+    """Finding the file yt-dlp wrote, when its name is user text.
+
+    A YouTube title reaches the filename intact, and it was being matched
+    with `glob`, which reads `[`, `]`, `*` and `?` as pattern syntax. A
+    track called "TEETH - Laklak [HQ AUDIO]" produced a pattern whose
+    bracket expression matched one character, found nothing, and reported a
+    finished download as having produced no file. Bracketed tags are close
+    to universal in YouTube titles.
+
+    This only surfaced once the extension stopped being known in advance:
+    while every download was forced to WAV, the exact path existed and the
+    glob was never reached.
+    """
+
+    def _locate(self, path):
+        from sipra_core.ingest.youtube import _locate_output
+
+        return _locate_output(path)
+
+    def test_finds_the_file_behind_a_bracketed_title(self, tmp_path):
+        (tmp_path / "TEETH - Laklak [HQ AUDIO].m4a").write_bytes(b"x")
+        found = self._locate(tmp_path / "TEETH - Laklak [HQ AUDIO].audio")
+        assert found is not None
+        assert found.name == "TEETH - Laklak [HQ AUDIO].m4a"
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Song [Official Video]",
+            "Song [4K] [Remastered]",
+            "Song ** stars",
+            "Song ? maybe",
+            "Song [] empty",
+            "Song [!not a class]",
+            "100% Real",
+            "a[b]c*d?e",
+        ],
+    )
+    def test_every_glob_metacharacter_in_a_title_is_handled(self, tmp_path, title):
+        (tmp_path / f"{title}.opus").write_bytes(b"x")
+        found = self._locate(tmp_path / f"{title}.audio")
+        assert found is not None, f"could not find the download for {title!r}"
+        assert found.name == f"{title}.opus"
+
+    def test_a_bracketed_title_does_not_match_a_different_file(self, tmp_path):
+        # The failure mode in reverse: a pattern that matches too much.
+        (tmp_path / "Song H.m4a").write_bytes(b"x")
+        assert self._locate(tmp_path / "Song [HQ].audio") is None
+
+    def test_prefers_a_known_audio_extension(self, tmp_path):
+        (tmp_path / "Song.m4a").write_bytes(b"x")
+        (tmp_path / "Song.json").write_bytes(b"{}")
+        assert self._locate(tmp_path / "Song.audio").suffix == ".m4a"
+
+    @pytest.mark.parametrize("suffix", [".part", ".ytdl", ".temp", ".tmp", ".download"])
+    def test_ignores_work_in_progress(self, tmp_path, suffix):
+        (tmp_path / f"Song{suffix}").write_bytes(b"x")
+        assert self._locate(tmp_path / "Song.audio") is None
+
+    def test_takes_the_exact_path_when_it_exists(self, tmp_path):
+        exact = tmp_path / "Song.audio"
+        exact.write_bytes(b"x")
+        assert self._locate(exact) == exact
+
+    def test_a_directory_is_not_mistaken_for_the_download(self, tmp_path):
+        (tmp_path / "Song.m4a").mkdir()
+        assert self._locate(tmp_path / "Song.audio") is None
+
+    def test_a_longer_stem_is_not_a_match(self, tmp_path):
+        (tmp_path / "Song Two.m4a").write_bytes(b"x")
+        assert self._locate(tmp_path / "Song.audio") is None
+
+    def test_missing_directory_returns_nothing_rather_than_raising(self, tmp_path):
+        assert self._locate(tmp_path / "gone" / "Song.audio") is None
+
+
+class TestReservingAStem:
+    """`unique_stem` had the identical fault, with a quieter symptom.
+
+    Matching with `glob` meant a bracketed stem reported every name as
+    free, so it reserved nothing and two downloads of similarly titled
+    tracks could land on each other.
+    """
+
+    def _reserve(self, directory, stem):
+        from sipra_core.ingest.local import unique_stem
+
+        return unique_stem(directory, stem, ".audio")
+
+    def test_detects_a_taken_bracketed_stem(self, tmp_path):
+        (tmp_path / "Song [HQ AUDIO].m4a").write_bytes(b"x")
+        chosen = self._reserve(tmp_path, "Song [HQ AUDIO]")
+        assert chosen.stem != "Song [HQ AUDIO]"
+
+    def test_leaves_a_free_bracketed_stem_alone(self, tmp_path):
+        chosen = self._reserve(tmp_path, "Song [HQ AUDIO]")
+        assert chosen.name == "Song [HQ AUDIO].audio"
+
+    def test_a_missing_directory_is_treated_as_empty(self, tmp_path):
+        chosen = self._reserve(tmp_path / "not-there", "Song")
+        assert chosen.name == "Song.audio"
+
+    def test_reservations_remain_distinct_across_metacharacters(self, tmp_path):
+        first = self._reserve(tmp_path, "Song [x]")
+        first.write_bytes(b"x")
+        second = self._reserve(tmp_path, "Song [x]")
+        assert second != first

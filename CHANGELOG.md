@@ -12,6 +12,54 @@ real hardware.
 
 ---
 
+## [0.9.9] — 2026-08-24
+
+"The download finished but no audio file was produced." It had been
+produced. Sipra could not see it.
+
+A regression from 0.9.8, and entirely self-inflicted. Dropping the forced
+WAV conversion meant the downloaded file's extension is no longer known in
+advance, so it is found afterwards by its stem — and that lookup used
+`glob`, which reads `[`, `]`, `*` and `?` as pattern syntax. A YouTube
+title lands in the filename intact, so "TEETH - Laklak [HQ AUDIO]" became
+a pattern whose bracket expression matches a single character. It matched
+nothing, and a completed download was reported as having produced no file.
+
+While every download was forced to WAV the exact path always existed and
+that lookup was never reached, which is why the fault arrived with the fix
+for the previous one.
+
+### Fixed
+
+- **A download whose title contains brackets is found again.** Filenames
+  are now compared literally instead of being matched as patterns.
+  Bracketed tags — `[Official Video]`, `[HQ AUDIO]`, `[4K]` — are close to
+  universal on YouTube, so this was not an edge case; it broke a large
+  share of real links.
+- **`unique_stem` had the identical fault with a quieter symptom.** It
+  reserves a filename by checking whether one is taken, and matching with
+  `glob` meant a bracketed name reported everything as free — so it
+  reserved nothing, and two similarly titled downloads could land on each
+  other. Nobody had hit it yet.
+
+### Tests
+
+- 633 TypeScript tests, 534 Python tests. Both lookups are now exercised
+  against every glob metacharacter a title can contain, including the
+  failure in reverse — a pattern that matches a *different* file — plus
+  work-in-progress extensions, directories sharing a name, and a stem that
+  is merely a prefix of another.
+
+### On this happening at all
+
+The 0.9.8 change was right and this was avoidable. Removing the guarantee
+that every download ended in `.wav` promoted a code path that had never
+run in practice, and I did not test it against a realistic title. The
+tests added here run against the names YouTube actually produces rather
+than against `Song.m4a`.
+
+---
+
 ## [0.9.8] — 2026-08-24
 
 A YouTube import stopped at 30% on "Reading the file". The log's last line

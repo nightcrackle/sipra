@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..audio_io import SUPPORTED_INPUT_EXTENSIONS
 from ..engines.base import CancellationToken
 from ..errors import CancelledError, ErrorCode, SipraError
 from .local import safe_filename, unique_stem
@@ -676,16 +677,51 @@ def download_audio(
     )
 
 
+#: Extensions that are work in progress, not a finished download.
+_INCOMPLETE_SUFFIXES = frozenset({".part", ".ytdl", ".temp", ".tmp", ".download"})
+
+
+def _same_stem(directory: Path, stem: str) -> list[Path]:
+    """Files in ``directory`` whose stem is exactly ``stem``.
+
+    Compared literally rather than matched with ``glob``. A YouTube title
+    is user text and lands in the filename intact, and ``glob`` reads
+    ``[``, ``]``, ``*`` and ``?`` as pattern syntax — so a track called
+    "TEETH - Laklak [HQ AUDIO]" produced a pattern whose bracket expression
+    matched a single character, found nothing, and reported a completed
+    download as having produced no file. Bracketed tags are close to
+    universal in YouTube titles, so this was not an edge case.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    return [
+        entry
+        for entry in entries
+        if entry.is_file()
+        and entry.stem == stem
+        and entry.suffix.lower() not in _INCOMPLETE_SUFFIXES
+    ]
+
+
 def _locate_output(expected: Path) -> Path | None:
     """Find what yt-dlp actually wrote.
 
-    Extraction should land exactly on ``expected``, but a codec fallback
-    can change the extension, so the sibling with the same stem is
-    accepted too.
+    The extension is not known in advance: it is whichever audio stream
+    yt-dlp took. So the file is found by its stem, and a known audio
+    extension is preferred over anything else in case an intermediate file
+    is still lying around.
     """
-    if expected.exists():
+    if expected.exists() and expected.is_file():
         return expected
-    for sibling in sorted(expected.parent.glob(f"{expected.stem}.*")):
-        if sibling.is_file() and sibling.suffix.lower() != ".part":
-            return sibling
-    return None
+
+    candidates = _same_stem(expected.parent, expected.stem)
+    if not candidates:
+        return None
+
+    def rank(path: Path) -> tuple[int, str]:
+        known = path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
+        return (0 if known else 1, path.name)
+
+    return sorted(candidates, key=rank)[0]
