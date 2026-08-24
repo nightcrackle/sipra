@@ -66,6 +66,32 @@ def unique_path(directory: str | Path, filename: str) -> Path:
     return base / f"{stem} ({hashlib.sha1(stem.encode()).hexdigest()[:8]}){suffix}"
 
 
+def unique_stem(directory: str | Path, stem: str, suffix: str) -> Path:
+    """A path whose *stem* is unused, whatever extension follows it.
+
+    :func:`unique_path` checks one exact filename, which is enough when the
+    extension is known. It is not enough for a download whose format is
+    decided by the server: the file is located afterwards by globbing the
+    stem, so a leftover ``Song.opus`` from a previous run would be picked
+    up as the result of a download that produced ``Song.m4a``. Reserving
+    the whole stem removes that possibility.
+    """
+    base = Path(directory)
+    normalised = suffix if suffix.startswith(".") else f".{suffix}"
+
+    def taken(candidate: str) -> bool:
+        return any(base.glob(f"{candidate}.*"))
+
+    if not taken(stem):
+        return base / f"{stem}{normalised}"
+    for counter in range(2, 1000):
+        candidate = f"{stem} ({counter})"
+        if not taken(candidate):
+            return base / f"{candidate}{normalised}"
+    digest = hashlib.sha1(stem.encode()).hexdigest()[:8]
+    return base / f"{stem} ({digest}){normalised}"
+
+
 def validate_input(path: str | Path) -> dict:
     """Check that ``path`` is an audio file Sipra is willing to open."""
     p = Path(path)

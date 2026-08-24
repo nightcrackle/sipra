@@ -14,7 +14,7 @@ from sipra_core.audio_io import (
     resample,
     write_audio,
 )
-from sipra_core.errors import ErrorCode, SipraError
+from sipra_core.errors import CancelledError, ErrorCode, SipraError
 
 from .conftest import dbfs_sine, sine, stereo
 
@@ -287,3 +287,206 @@ class TestMixDown:
     def test_empty_input_raises(self):
         with pytest.raises(SipraError):
             mix_down([])
+
+
+class TestDecodeReporting:
+    """Decoding used to be one opaque call.
+
+    A real job stopped inside it and left a log whose last line was
+    "decoding <name>" with nothing after it — the same amount of help as no
+    log at all. Decoding now reads in blocks, so it reports as it goes and
+    notices a cancel partway through.
+    """
+
+    class _Token:
+        def __init__(self, cancelled: bool = False) -> None:
+            self._cancelled = cancelled
+
+        @property
+        def cancelled(self) -> bool:
+            return self._cancelled
+
+        def cancel(self) -> None:
+            self._cancelled = True
+
+    def test_reports_progress_while_decoding(self, wav_file):
+        seen: list[float] = []
+        path = wav_file(stereo(sine(440, 2.0)), name="long.wav")
+        load_audio(path, on_progress=seen.append)
+        assert seen, "a decode that reports nothing looks like one that stopped"
+        assert seen == sorted(seen)
+        assert seen[-1] == pytest.approx(1.0)
+
+    def test_progress_stays_within_the_unit_interval(self, wav_file):
+        seen: list[float] = []
+        load_audio(wav_file(stereo(sine(440, 1.0))), on_progress=seen.append)
+        assert all(0.0 <= value <= 1.0 for value in seen)
+
+    def test_block_reads_produce_the_same_samples_as_one_read(self, wav_file, monkeypatch):
+        """The safety net on splitting the read up.
+
+        Reading in blocks is only acceptable if it changes nothing about
+        the audio, so this pins it against a single-call read.
+        """
+        path = wav_file(stereo(sine(330, 1.0) * 0.7), name="blocks.wav")
+        whole = load_audio(path)
+        monkeypatch.setattr(audio_io, "DECODE_BLOCK_FRAMES", 1024)
+        blocked = load_audio(path)
+        assert blocked.data.shape == whole.data.shape
+        assert np.array_equal(blocked.data, whole.data)
+
+    def test_a_tiny_block_size_still_decodes_the_whole_file(self, wav_file, monkeypatch):
+        monkeypatch.setattr(audio_io, "DECODE_BLOCK_FRAMES", 7)
+        buf = load_audio(wav_file(stereo(sine(440, 0.1))))
+        assert buf.frames == pytest.approx(4410, abs=2)
+
+    def test_cancellation_is_honoured_partway_through(self, wav_file, monkeypatch):
+        monkeypatch.setattr(audio_io, "DECODE_BLOCK_FRAMES", 512)
+        token = self._Token()
+        path = wav_file(stereo(sine(440, 1.0)), name="cancelme.wav")
+
+        def cancel_after_first(_fraction: float) -> None:
+            token.cancel()
+
+        with pytest.raises(CancelledError):
+            load_audio(path, on_progress=cancel_after_first, token=token)
+
+    def test_an_uncancelled_token_changes_nothing(self, wav_file):
+        buf = load_audio(wav_file(stereo(sine(440, 0.2))), token=self._Token())
+        assert buf.frames > 0
+
+    def test_output_is_contiguous_channels_first(self, wav_file):
+        buf = load_audio(wav_file(stereo(sine(440, 0.2))))
+        assert buf.data.shape[0] == 2
+        assert buf.data.flags["C_CONTIGUOUS"]
+
+
+class TestDecodeDeadlines:
+    """Nothing that decodes may be able to wait forever.
+
+    The downloader was given a timeout after a hung yt-dlp stopped an
+    import. The identical defect stayed in this module until a hung ffmpeg
+    stopped an import the same way. Both are covered now, and a static test
+    in the ingest suite fails if a new one appears.
+    """
+
+    def test_the_decode_timeout_is_finite_and_generous(self):
+        assert 60 < audio_io.DECODE_TIMEOUT_SECONDS < 60 * 60
+
+    def test_the_probe_timeout_is_short(self):
+        # It reads a header. If it cannot answer quickly it will not answer.
+        assert 0 < audio_io.FFPROBE_TIMEOUT_SECONDS <= 60
+
+    def test_a_decoder_that_never_finishes_is_killed(self, tmp_path):
+        """A stand-in for ffmpeg that produces nothing and does not exit."""
+        import subprocess
+        import sys
+        import textwrap
+
+        script = tmp_path / "hang.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import time
+                time.sleep(600)
+                """
+            )
+        )
+        with pytest.raises(SipraError) as info:
+            audio_io._run_streaming(
+                [sys.executable, str(script)],
+                expected_bytes=0,
+                timeout=1.0,
+                on_progress=None,
+                token=None,
+                label="stand-in",
+            )
+        assert info.value.code == ErrorCode.DECODE_FAILED
+        assert "did not finish" in str(info.value)
+        assert isinstance(subprocess.TimeoutExpired, type)
+
+    def test_a_decoder_that_floods_stderr_does_not_deadlock(self, tmp_path):
+        """The other half of the same lesson.
+
+        A child blocked writing to a full stderr pipe, while the parent is
+        blocked reading stdout, is a deadlock no timeout on `wait` can
+        reach — the wait is never arrived at. stderr is drained on its own
+        thread; this floods far past a pipe buffer to prove it.
+        """
+        import sys
+        import textwrap
+
+        script = tmp_path / "flood.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import sys
+                sys.stderr.write("x" * 512 * 1024)
+                sys.stderr.flush()
+                sys.stdout.buffer.write(b"\\x00\\x00\\x80\\x3f" * 16)
+                sys.stdout.flush()
+                """
+            )
+        )
+        payload, stderr = audio_io._run_streaming(
+            [sys.executable, str(script)],
+            expected_bytes=64,
+            timeout=30.0,
+            on_progress=None,
+            token=None,
+            label="stand-in",
+        )
+        assert len(payload) == 64
+        assert len(stderr) > 400_000
+
+    def test_a_failing_decoder_reports_its_stderr(self, tmp_path):
+        import sys
+        import textwrap
+
+        script = tmp_path / "fail.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import sys
+                sys.stderr.write("Invalid data found when processing input\\n")
+                sys.exit(1)
+                """
+            )
+        )
+        with pytest.raises(SipraError) as info:
+            audio_io._run_streaming(
+                [sys.executable, str(script)],
+                expected_bytes=0,
+                timeout=30.0,
+                on_progress=None,
+                token=None,
+                label="stand-in",
+            )
+        assert "Invalid data" in str(info.value.details.get("stderr", ""))
+
+    def test_cancellation_kills_the_decoder(self, tmp_path):
+        import sys
+        import textwrap
+
+        script = tmp_path / "slow.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import time
+                time.sleep(600)
+                """
+            )
+        )
+
+        class _Cancelled:
+            cancelled = True
+
+        with pytest.raises(CancelledError):
+            audio_io._run_streaming(
+                [sys.executable, str(script)],
+                expected_bytes=0,
+                timeout=60.0,
+                on_progress=None,
+                token=_Cancelled(),
+                label="stand-in",
+            )

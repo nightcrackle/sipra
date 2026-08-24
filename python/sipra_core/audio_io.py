@@ -19,15 +19,47 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import soundfile as sf
 
-from .errors import ErrorCode, SipraError
+from .errors import CancelledError, ErrorCode, SipraError
 from .trace import trace
+
+
+class Cancellable(Protocol):
+    """Just the part of a cancellation token this module needs."""
+
+    @property
+    def cancelled(self) -> bool: ...
+
+
+#: Frames read per block from libsndfile. About four megabytes of stereo
+#: float, so progress moves several times a second on a long track without
+#: the read loop itself costing anything measurable.
+DECODE_BLOCK_FRAMES = 1 << 19
+
+#: Bytes read per chunk from a decoder's stdout.
+DECODE_CHUNK_BYTES = 1 << 20
+
+#: Ceiling on decoding one file. Generous — an hour of audio on a slow disk
+#: is minutes of honest work — but finite, which is the point. A decoder
+#: that stops responding used to stop the job with it until the app was
+#: closed.
+DECODE_TIMEOUT_SECONDS = 900
+
+#: Ceiling on the metadata probe. It reads a header.
+FFPROBE_TIMEOUT_SECONDS = 30
+
+#: How often a running decoder is checked for cancellation and for its
+#: deadline. Short enough that Cancel feels immediate.
+DECODE_POLL_SECONDS = 0.25
 
 # Extensions we advertise in the UI's file picker.
 SUPPORTED_INPUT_EXTENSIONS: tuple[str, ...] = (
@@ -127,6 +159,7 @@ def load_audio(
     target_sample_rate: int | None = None,
     mono: bool = False,
     on_progress: Callable[[float], None] | None = None,
+    token: Cancellable | None = None,
 ) -> AudioBuffer:
     """Decode ``path`` into a float32 :class:`AudioBuffer`.
 
@@ -154,14 +187,30 @@ def load_audio(
             {"path": str(p), "sizeBytes": size},
         )
 
+    # Decoding reports across the first half of whatever the caller gave
+    # it, leaving the second half for a rate conversion if one is needed.
+    # Before this, a decode of a large file was a single opaque call: a job
+    # that stopped inside it left a log whose last line was "decoding
+    # <name>" and nothing after it, which is exactly as much help as no log
+    # at all.
+    def _decoding(fraction: float) -> None:
+        if on_progress:
+            on_progress(0.5 * min(1.0, max(0.0, fraction)))
+
+    trace("decoder starting", file=p.name, sizeMb=round(size / 1024 / 1024, 1))
     try:
-        data, sr = _load_with_soundfile(p)
-    except SipraError:
+        data, sr = _load_with_soundfile(p, on_progress=_decoding, token=token)
+        trace("decoded with libsndfile", rate=sr, frames=int(data.shape[1]))
+    except (SipraError, CancelledError):
         raise
     except Exception as sf_exc:
+        trace("libsndfile declined, handing to ffmpeg", reason=str(sf_exc)[:120])
         try:
-            data, sr = _load_with_ffmpeg(p, target_sample_rate)
-        except SipraError:
+            data, sr = _load_with_ffmpeg(
+                p, target_sample_rate, on_progress=_decoding, token=token
+            )
+            trace("decoded with ffmpeg", rate=sr, frames=int(data.shape[1]))
+        except (SipraError, CancelledError):
             raise
         except Exception as ff_exc:  # pragma: no cover - depends on host tools
             raise SipraError(
@@ -186,19 +235,70 @@ def load_audio(
     if target_sample_rate and target_sample_rate != buf.sample_rate:
         # Only reachable via libsndfile — the ffmpeg path was given the
         # target rate and already produced it.
-        buf = resample(buf, target_sample_rate, on_progress=on_progress)
+        buf = resample(
+            buf,
+            target_sample_rate,
+            on_progress=lambda f: on_progress(0.5 + 0.5 * f) if on_progress else None,
+        )
     elif on_progress:
         on_progress(1.0)
     return buf
 
 
-def _load_with_soundfile(path: Path) -> tuple[np.ndarray, int]:
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+def _load_with_soundfile(
+    path: Path,
+    on_progress: Callable[[float], None] | None = None,
+    token: Cancellable | None = None,
+) -> tuple[np.ndarray, int]:
+    """Decode with libsndfile, a block at a time.
+
+    Read in blocks rather than in one call so the caller can report
+    progress and so a cancel is honoured partway through. A whole-file read
+    of a long track is tens of seconds of nothing on a slow disk — the same
+    silence as a stall, and this is the step a real job stopped in.
+    """
+    with sf.SoundFile(str(path)) as handle:
+        channels = int(handle.channels)
+        rate = int(handle.samplerate)
+        frames = int(handle.frames)
+
+        if frames <= 0:
+            # A stream whose length libsndfile cannot state up front. Rare
+            # for the formats it opens, but it must not become a crash.
+            data = handle.read(dtype="float32", always_2d=True)
+            if on_progress:
+                on_progress(1.0)
+            return np.ascontiguousarray(np.asarray(data, dtype=np.float32).T), rate
+
+        # One allocation for the result; blocks are read straight into it.
+        out = np.empty((frames, channels), dtype=np.float32)
+        position = 0
+        while position < frames:
+            if token is not None and token.cancelled:
+                raise CancelledError("Decoding cancelled")
+            want = min(DECODE_BLOCK_FRAMES, frames - position)
+            chunk = handle.read(
+                want, dtype="float32", always_2d=True, out=out[position : position + want]
+            )
+            got = int(np.asarray(chunk).shape[0])
+            if got <= 0:
+                # The header promised more than the file holds.
+                out = out[:position]
+                break
+            position += got
+            if on_progress:
+                on_progress(position / frames)
+
     # soundfile yields (frames, channels); the core wants (channels, frames).
-    return np.ascontiguousarray(data.T), int(sr)
+    return np.ascontiguousarray(out.T), rate
 
 
-def _load_with_ffmpeg(path: Path, target_sample_rate: int | None = None) -> tuple[np.ndarray, int]:
+def _load_with_ffmpeg(
+    path: Path,
+    target_sample_rate: int | None = None,
+    on_progress: Callable[[float], None] | None = None,
+    token: Cancellable | None = None,
+) -> tuple[np.ndarray, int]:
     """Decode to float32 PCM, optionally converting the rate on the way.
 
     Handing ffmpeg the target rate is free — it resamples while it streams,
@@ -229,25 +329,154 @@ def _load_with_ffmpeg(path: Path, target_sample_rate: int | None = None) -> tupl
         "-ac", str(channels),
         "-",
     ]
-    proc = subprocess.run(
+
+    # Expected output size, for progress. Wrong or missing duration only
+    # costs a less accurate bar, never a wrong result.
+    duration = meta.get("duration") or 0.0
+    expected = int(duration * sr * channels * 4) if duration > 0 else 0
+
+    payload, stderr = _run_streaming(
         cmd,
-        capture_output=True,
-        check=False,
+        expected_bytes=expected,
+        timeout=DECODE_TIMEOUT_SECONDS,
+        on_progress=on_progress,
+        token=token,
+        label="ffmpeg",
+    )
+
+    if not payload:
+        raise SipraError(
+            ErrorCode.DECODE_FAILED,
+            "ffmpeg could not decode this file",
+            {"stderr": stderr[-800:]},
+        )
+
+    flat = np.frombuffer(payload, dtype="<f4")
+    usable = (flat.size // channels) * channels
+    interleaved = flat[:usable].reshape(-1, channels)
+    return np.ascontiguousarray(interleaved.T.astype(np.float32)), sr
+
+
+def _run_streaming(
+    cmd: list[str],
+    expected_bytes: int,
+    timeout: float,
+    on_progress: Callable[[float], None] | None,
+    token: Cancellable | None,
+    label: str,
+) -> tuple[bytes, str]:
+    """Run a command, reading stdout in chunks against a deadline.
+
+    Three things this does that ``subprocess.run`` cannot:
+
+    * **It ends.** ``subprocess.run`` here carried no timeout at all, so a
+      decoder that stopped responding stopped the job with it, for as long
+      as the app stayed open. That is the same defect that was fixed in the
+      downloader and left in place here.
+    * **It reports.** Decoding a long track is tens of seconds of output
+      arriving steadily; a bar that does not move through it is
+      indistinguishable from one that has stopped.
+    * **It can be cancelled.** The check happens between chunks, so Cancel
+      works during a decode instead of waiting it out.
+
+    stderr is drained on its own thread for the reason it always is: a
+    child blocked writing to a full stderr pipe while the parent blocks
+    reading stdout is a deadlock that no timeout on ``wait`` can reach.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         # Never inherit the sidecar's stdin; see ingest/youtube.py.
         stdin=subprocess.DEVNULL,
         creationflags=_creation_flags(),
     )
-    if proc.returncode != 0 or not proc.stdout:
+
+    errors: list[bytes] = []
+
+    def _drain() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                errors.append(line)
+                if len(errors) > 200:
+                    del errors[:100]
+        except Exception:  # pragma: no cover - stream closed under us
+            pass
+
+    drain = threading.Thread(target=_drain, name=f"{label}-stderr", daemon=True)
+    drain.start()
+
+    chunks: list[bytes] = []
+    counter = {"read": 0}
+
+    # stdout is read on its own thread as well.
+    #
+    # `read()` blocks until it has a full chunk or the pipe closes. A
+    # deadline checked around that read is not a deadline: a child that
+    # produces nothing and does not exit blocks in it forever, which is
+    # precisely the failure being guarded against. The poll loop below owns
+    # the clock, and it can always run.
+    def _pump() -> None:
+        if proc.stdout is None:
+            return
+        try:
+            while True:
+                chunk = proc.stdout.read(DECODE_CHUNK_BYTES)
+                if not chunk:
+                    return
+                chunks.append(chunk)
+                counter["read"] += len(chunk)
+                if on_progress and expected_bytes > 0:
+                    on_progress(min(0.99, counter["read"] / expected_bytes))
+        except Exception:  # pragma: no cover - stream closed under us
+            pass
+
+    pump = threading.Thread(target=_pump, name=f"{label}-stdout", daemon=True)
+    pump.start()
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if token is not None and token.cancelled:
+                proc.kill()
+                raise CancelledError(f"{label} cancelled")
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise SipraError(
+                    ErrorCode.DECODE_FAILED,
+                    f"{label} did not finish within {int(timeout)} seconds.",
+                    {"timeoutSeconds": int(timeout), "bytesRead": counter["read"]},
+                )
+            try:
+                proc.wait(timeout=DECODE_POLL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except CancelledError:
+        raise
+    finally:
+        pump.join(timeout=5)
+        drain.join(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # pragma: no cover
+                    pass
+
+    if on_progress:
+        on_progress(1.0)
+
+    text = b"".join(errors).decode("utf-8", "replace")
+    if proc.returncode != 0:
         raise SipraError(
             ErrorCode.DECODE_FAILED,
-            "ffmpeg could not decode this file",
-            {"stderr": proc.stderr.decode("utf-8", "replace")[-800:]},
+            f"{label} failed while decoding this file.",
+            {"stderr": text[-800:], "returncode": proc.returncode},
         )
-
-    flat = np.frombuffer(proc.stdout, dtype="<f4")
-    usable = (flat.size // channels) * channels
-    interleaved = flat[:usable].reshape(-1, channels)
-    return np.ascontiguousarray(interleaved.T.astype(np.float32)), sr
+    return b"".join(chunks), text
 
 
 def _ffprobe_stream(ffmpeg_exe: str, path: Path) -> dict:
@@ -261,7 +490,7 @@ def _ffprobe_stream(ffmpeg_exe: str, path: Path) -> dict:
             "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
         )
     )
-    fallback = {"sample_rate": 44100, "channels": 2}
+    fallback = {"sample_rate": 44100, "channels": 2, "duration": 0.0}
     if not Path(probe_exe).exists() and not shutil.which(probe_exe):
         return fallback
     try:
@@ -270,24 +499,44 @@ def _ffprobe_stream(ffmpeg_exe: str, path: Path) -> dict:
                 probe_exe,
                 "-v", "error",
                 "-select_streams", "a:0",
-                "-show_entries", "stream=sample_rate,channels",
+                "-show_entries", "stream=sample_rate,channels,duration",
                 "-of", "csv=p=0",
                 str(path),
             ],
             capture_output=True,
             check=False,
             stdin=subprocess.DEVNULL,
+            # A probe that cannot answer in half a minute is not going to.
+            # Without this it could hold a job open indefinitely, which is
+            # the defect that was fixed in the downloader and left here.
+            timeout=FFPROBE_TIMEOUT_SECONDS,
             creationflags=_creation_flags(),
         )
         parts = proc.stdout.decode("utf-8", "replace").strip().split(",")
+        if len(parts) >= 3 and parts[0] and parts[1]:
+            sr = int(parts[0])
+            ch = int(parts[1])
+            duration = _to_float(parts[2])
+            if sr > 0 and 1 <= ch <= 8:
+                return {"sample_rate": sr, "channels": ch, "duration": duration}
         if len(parts) >= 2 and parts[0] and parts[1]:
             sr = int(parts[0])
             ch = int(parts[1])
             if sr > 0 and 1 <= ch <= 8:
-                return {"sample_rate": sr, "channels": ch}
+                return {"sample_rate": sr, "channels": ch, "duration": 0.0}
+    except subprocess.TimeoutExpired:
+        trace("ffprobe timed out; assuming CD-quality stereo", file=path.name)
     except Exception:  # pragma: no cover - defensive
         pass
     return fallback
+
+
+def _to_float(text: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
 
 
 def resample(

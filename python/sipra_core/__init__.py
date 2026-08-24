@@ -9,5 +9,5 @@ model-weight download performed by the separation engine.
 
 from __future__ import annotations
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 __all__ = ["__version__"]

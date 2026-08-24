@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +35,7 @@ from urllib.parse import urlparse
 
 from ..engines.base import CancellationToken
 from ..errors import CancelledError, ErrorCode, SipraError
-from .local import safe_filename, unique_path
+from .local import safe_filename, unique_stem
 
 ProgressFn = Callable[[str, float], None]
 
@@ -63,6 +64,11 @@ def _timeout_from_env(name: str, default: int) -> int:
 
 DOWNLOAD_TIMEOUT_SECONDS = _timeout_from_env("SIPRA_YTDLP_DOWNLOAD_TIMEOUT", 20 * 60)
 
+# How often the download is checked for cancellation and for the
+# deadline. Short enough that Cancel feels immediate, long enough to
+# cost nothing.
+DOWNLOAD_POLL_SECONDS = 0.5
+
 # Reading metadata is one HTTPS round trip, but the wall-clock cost is not
 # that. yt-dlp for Windows is a PyInstaller single-file bundle: the first
 # run unpacks ~17 MB into %TEMP% and Windows Defender scans it as it goes,
@@ -90,6 +96,12 @@ NETWORK_RETRIES = 2
 MAX_DURATION_SECONDS = 60 * 20
 
 _PROGRESS_PATTERN = re.compile(r"\[download\]\s+([0-9.]+)%")
+
+# Placeholder extension for the download target.
+#
+# The real one is decided by whatever stream yt-dlp takes, so the name is
+# reserved by stem and the produced file located afterwards.
+DOWNLOAD_PLACEHOLDER_SUFFIX = ".audio"
 
 # A YouTube video id is exactly 11 characters from a fixed alphabet.
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -516,7 +528,7 @@ def download_audio(
         )
 
     title = safe_filename(meta.get("title") or "youtube-audio", "youtube-audio")
-    target = unique_path(dest, f"{title}.wav")
+    target = unique_stem(dest, title, DOWNLOAD_PLACEHOLDER_SUFFIX)
 
     cmd = [
         exe,
@@ -525,8 +537,16 @@ def download_audio(
         "--no-continue",
         "--no-part",
         "--newline",
+        # Take the audio stream as it comes.
+        #
+        # This used to ask for `--audio-format wav`, which makes yt-dlp run
+        # a second full ffmpeg pass to expand a few megabytes of compressed
+        # audio into a few hundred megabytes of PCM — a file Sipra then
+        # decodes and deletes. Every byte of that was wasted: the decoder
+        # reads m4a and opus perfectly well, and the download that appeared
+        # to stall while "Reading the file" was reading the product of that
+        # conversion.
         "--extract-audio",
-        "--audio-format", "wav",
         "--audio-quality", "0",
         "--output", str(target.with_suffix(".%(ext)s")),
         "--",
@@ -568,37 +588,64 @@ def download_audio(
         except Exception:  # pragma: no cover - stream closed under us
             pass
 
-    stderr_thread = threading.Thread(target=_drain_stderr, name="yt-dlp-stderr", daemon=True)
-    stderr_thread.start()
+    # stdout is drained on its own thread as well.
+    #
+    # Reading it inline meant the deadline lived on the `wait()` after the
+    # loop, and the loop only ends when yt-dlp closes stdout. A process
+    # that goes quiet without exiting — a stalled connection, a paused
+    # transfer — blocks in the read forever and never reaches the timeout
+    # that was supposed to catch exactly that. The same shape holds for
+    # cancellation: with the read inline, Cancel was only noticed when the
+    # next line happened to arrive.
+    def _drain_stdout() -> None:
+        if proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                match = _PROGRESS_PATTERN.search(line)
+                if match:
+                    try:
+                        report("download", min(float(match.group(1)) / 100.0, 0.999))
+                    except ValueError:  # pragma: no cover
+                        pass
+        except Exception:  # pragma: no cover - stream closed under us
+            pass
 
+    stderr_thread = threading.Thread(target=_drain_stderr, name="yt-dlp-stderr", daemon=True)
+    stdout_thread = threading.Thread(target=_drain_stdout, name="yt-dlp-stdout", daemon=True)
+    stderr_thread.start()
+    stdout_thread.start()
+
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT_SECONDS
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
+        while True:
             if token is not None and token.cancelled:
                 proc.kill()
                 raise CancelledError("Download cancelled")
-            match = _PROGRESS_PATTERN.search(line)
-            if match:
-                try:
-                    report("download", min(float(match.group(1)) / 100.0, 0.999))
-                except ValueError:  # pragma: no cover
-                    pass
-        proc.wait(timeout=DOWNLOAD_TIMEOUT_SECONDS)
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise SipraError(
+                    ErrorCode.DOWNLOAD_FAILED,
+                    f"The download did not finish within "
+                    f"{DOWNLOAD_TIMEOUT_SECONDS // 60} minutes.",
+                    {"stderr": "\n".join(stderr_lines)[-600:], "hints": _hint_lines()},
+                )
+            try:
+                proc.wait(timeout=DOWNLOAD_POLL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                continue
     except CancelledError:
         raise
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        raise SipraError(
-            ErrorCode.DOWNLOAD_FAILED,
-            f"The download did not finish within {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes.",
-            {"stderr": "\n".join(stderr_lines)[-600:], "hints": _hint_lines()},
-        ) from exc
     finally:
+        stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # pragma: no cover
+                    pass
 
     stderr_tail = stderr_lines[-12:]
 

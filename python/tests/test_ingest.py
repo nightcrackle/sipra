@@ -779,6 +779,102 @@ class TestChildProcessIsolation:
         )
 
 
+class TestEverySubprocessCanEnd:
+    """No spawn anywhere in the package may be able to wait forever.
+
+    This test exists because of how the same bug was fixed twice. A yt-dlp
+    call with no timeout hung an import; the timeout was added to
+    ``ingest/youtube.py`` and the identical defect sat untouched in
+    ``audio_io.py`` until an ffmpeg decode hung an import in exactly the
+    same way, months of releases later. Fixing the file that was reported
+    is not the same as fixing the fault.
+
+    ``subprocess.run`` carries its own deadline, so it must pass one.
+    ``Popen`` has none, so a file that uses it must manage a deadline
+    itself — and is listed here, so adding a new one is a deliberate act
+    rather than an oversight.
+    """
+
+    #: Files that drive a Popen against a deadline of their own making.
+    #: Each reads output incrementally, which `run` cannot do, and each is
+    #: checked below for an actual deadline.
+    POPEN_OWNERS = {"audio_io.py", "ingest/youtube.py"}
+
+    def _calls(self, text: str, pattern: str):
+        """Yield (line number, argument text) for each matching call."""
+        import re
+
+        for match in re.finditer(pattern, text):
+            start = match.end()
+            depth = 1
+            index = start
+            while index < len(text) and depth:
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+                index += 1
+            yield text[: match.start()].count("\n") + 1, text[start:index]
+
+    def _sources(self):
+        from pathlib import Path
+
+        import sipra_core
+
+        root = Path(sipra_core.__file__).parent
+        for source in sorted(root.rglob("*.py")):
+            yield source.relative_to(root).as_posix(), source.read_text(encoding="utf-8")
+
+    def test_every_subprocess_run_carries_a_timeout(self):
+        offenders = [
+            f"{name}:{line}"
+            for name, text in self._sources()
+            for line, call in self._calls(text, r"subprocess\.run\(")
+            if "timeout=" not in call
+        ]
+        assert not offenders, (
+            "these calls can wait forever: " + ", ".join(offenders)
+        )
+
+    def test_only_declared_files_use_popen(self):
+        users = {
+            name
+            for name, text in self._sources()
+            for _line, _call in self._calls(text, r"subprocess\.Popen\(")
+        }
+        undeclared = users - self.POPEN_OWNERS
+        assert not undeclared, (
+            "these files spawn a Popen without declaring how it ends: "
+            + ", ".join(sorted(undeclared))
+        )
+
+    def test_every_popen_file_enforces_a_deadline(self):
+        missing = []
+        for name, text in self._sources():
+            if name not in self.POPEN_OWNERS:
+                continue
+            has_wait = "wait(timeout=" in text or "communicate(timeout=" in text
+            has_clock = "time.monotonic()" in text
+            if not (has_wait and has_clock):
+                missing.append(name)
+        assert not missing, (
+            "these files own a Popen but do not bound it: " + ", ".join(missing)
+        )
+
+    def test_the_declared_list_has_no_stale_entries(self):
+        # A file that stops using Popen should leave the list, or the list
+        # stops meaning anything.
+        users = {
+            name
+            for name, text in self._sources()
+            for _line, _call in self._calls(text, r"subprocess\.Popen\(")
+        }
+        assert users >= self.POPEN_OWNERS, (
+            "declared but no longer using Popen: "
+            + ", ".join(sorted(self.POPEN_OWNERS - users))
+        )
+
+
 _STDIN_READER = '''#!{python}
 import sys
 if "--version" in sys.argv:
@@ -835,3 +931,69 @@ class TestDeterministicInvocation:
         monkeypatch.setattr(subprocess, "run", _run)
         youtube.ensure_ready()
         assert "--ignore-config" in seen[0]
+
+
+class TestDownloadFormat:
+    """What the downloader asks for.
+
+    It used to force `--audio-format wav`, which makes yt-dlp run a second
+    full ffmpeg pass expanding a few megabytes of compressed audio into
+    hundreds of megabytes of PCM — a file Sipra then decodes and deletes.
+    The import that appeared to stall while "Reading the file" was reading
+    the product of that conversion.
+    """
+
+    def test_does_not_force_a_wav_conversion(self):
+        import inspect
+
+        from sipra_core.ingest import youtube
+
+        source = inspect.getsource(youtube.download_audio)
+        assert '"--audio-format", "wav"' not in source
+        assert '"--extract-audio"' in source
+
+    def test_reserves_the_whole_stem_because_the_extension_is_unknown(self, tmp_path):
+        from sipra_core.ingest.local import unique_stem
+
+        (tmp_path / "Song.opus").write_bytes(b"x")
+        chosen = unique_stem(tmp_path, "Song", ".audio")
+        # Not "Song.audio": a leftover Song.opus would be found by the glob
+        # that locates the download afterwards.
+        assert chosen.stem != "Song"
+        assert chosen.suffix == ".audio"
+
+    def test_a_free_stem_is_used_as_is(self, tmp_path):
+        from sipra_core.ingest.local import unique_stem
+
+        assert unique_stem(tmp_path, "Song", ".audio").name == "Song.audio"
+
+    def test_successive_reservations_do_not_collide(self, tmp_path):
+        from sipra_core.ingest.local import unique_stem
+
+        first = unique_stem(tmp_path, "Song", ".audio")
+        first.write_bytes(b"x")
+        second = unique_stem(tmp_path, "Song", ".audio")
+        assert second != first
+        second.write_bytes(b"x")
+        assert unique_stem(tmp_path, "Song", ".audio") not in (first, second)
+
+    def test_a_suffix_without_a_dot_is_accepted(self, tmp_path):
+        from sipra_core.ingest.local import unique_stem
+
+        assert unique_stem(tmp_path, "Song", "audio").suffix == ".audio"
+
+    def test_the_download_polls_rather_than_blocking_on_output(self):
+        """The deadline has to be reachable.
+
+        Reading stdout inline meant the timeout lived on the wait() after
+        the loop, and the loop only ends when yt-dlp closes stdout. A
+        download that goes quiet without exiting blocked in the read and
+        never reached the timeout meant to catch exactly that.
+        """
+        import inspect
+
+        from sipra_core.ingest import youtube
+
+        source = inspect.getsource(youtube.download_audio)
+        assert "DOWNLOAD_POLL_SECONDS" in source
+        assert "time.monotonic()" in source

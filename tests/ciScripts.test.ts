@@ -2,7 +2,7 @@
  * The two scripts that stand between the test suite and GitHub.
  *
  * Neither is exciting, and both fail in ways that are invisible when they
- * go wrong: a badge whose URL still says OWNER/REPO renders as a blank
+ * go wrong: a badge whose URL still says nightcrackle/sipra renders as a blank
  * image forever, and a summary parser that misreads a report quietly
  * claims a run passed. They are covered for the same reason the rest of
  * this suite exists — a silent wrong answer is worse than a loud one.
@@ -144,15 +144,15 @@ describe('isRepoSlug', () => {
 
 describe('rewrite', () => {
   const readme = [
-    '[![TypeScript](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)]' +
-      '(https://github.com/OWNER/REPO/actions/workflows/ci.yml)',
-    '[![Python](https://github.com/OWNER/REPO/actions/workflows/python.yml/badge.svg)]' +
-      '(https://github.com/OWNER/REPO/actions/workflows/python.yml)',
+    '[![TypeScript](https://github.com/nightcrackle/sipra/actions/workflows/ci.yml/badge.svg)]' +
+      '(https://github.com/nightcrackle/sipra/actions/workflows/ci.yml)',
+    '[![Python](https://github.com/nightcrackle/sipra/actions/workflows/python.yml/badge.svg)]' +
+      '(https://github.com/nightcrackle/sipra/actions/workflows/python.yml)',
   ].join('\n');
 
   it('replaces every occurrence, image and link alike', () => {
     const out = rewrite(readme, 'alice/sipra');
-    expect(out).not.toContain('OWNER/REPO');
+    expect(out).not.toContain('nightcrackle/sipra');
     expect(out.match(/alice\/sipra/g)).toHaveLength(4);
   });
 

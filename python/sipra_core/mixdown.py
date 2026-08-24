@@ -40,6 +40,9 @@ SUPPORTED_FORMATS: tuple[str, ...] = ("wav", "flac", "mp3")
 # Guard against a request that would fill the user's disk.
 MAX_OUTPUT_SECONDS = 60 * 60
 
+# Ceiling on one MP3 encode. See _encode_mp3.
+MP3_ENCODE_TIMEOUT_SECONDS = 15 * 60
+
 
 def db_to_gain(db: float) -> float:
     """Decibels to a linear gain. ``-inf`` and very low values mean silence."""
@@ -347,19 +350,31 @@ def _encode_mp3(source: Path, target: Path, bitrate: str = "320k") -> None:
             "MP3 export needs ffmpeg, which was not found. Export WAV or FLAC instead.",
         )
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    proc = subprocess.run(
-        [
-            exe, "-v", "error", "-nostdin", "-y",
-            "-i", str(source),
-            "-codec:a", "libmp3lame",
-            "-b:a", bitrate,
-            str(target),
-        ],
-        capture_output=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        creationflags=flags,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                exe, "-v", "error", "-nostdin", "-y",
+                "-i", str(source),
+                "-codec:a", "libmp3lame",
+                "-b:a", bitrate,
+                str(target),
+            ],
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            # Encoding an hour of audio to MP3 is a minute or two of real
+            # work. This is not a performance limit, it is a guarantee that
+            # an export which stops responding stops rather than holding
+            # the worker for the rest of the session.
+            timeout=MP3_ENCODE_TIMEOUT_SECONDS,
+            creationflags=flags,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SipraError(
+            ErrorCode.INTERNAL,
+            f"MP3 encoding did not finish within {MP3_ENCODE_TIMEOUT_SECONDS // 60} minutes.",
+            {"timeoutSeconds": MP3_ENCODE_TIMEOUT_SECONDS},
+        ) from exc
     if proc.returncode != 0 or not target.exists():
         raise SipraError(
             ErrorCode.INTERNAL,

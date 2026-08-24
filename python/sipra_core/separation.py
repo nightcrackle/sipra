@@ -215,7 +215,9 @@ def separate_track(
         target_sample_rate=engine_rate or None,
         # Decoding is the first 6% of the bar; a rate conversion here gets
         # the back half of it rather than happening in silence.
-        on_progress=lambda f: progress.report("decode", 0.5 + 0.5 * f),
+        on_progress=lambda f: progress.report("decode", f),
+        # So Cancel works during a long decode instead of waiting it out.
+        token=token,
     )
     progress.report("decode", 1.0)
     _log_stage(

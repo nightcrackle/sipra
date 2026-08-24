@@ -12,6 +12,76 @@ real hardware.
 
 ---
 
+## [0.9.8] — 2026-08-24
+
+A YouTube import stopped at 30% on "Reading the file". The log's last line
+was `decoding TEETH - Laklak [HQ AUDIO].wav | at=44100` and nothing after
+it — decoding was a single opaque call, so the record stopped exactly
+where it needed to keep going.
+
+Two things were wrong. The file being read was a WAV that need never have
+existed, and the code reading it could not be interrupted, could not
+report, and had no deadline.
+
+### Fixed
+
+- **Downloads are no longer expanded to WAV.** yt-dlp was told
+  `--audio-format wav`, which makes it run a second full ffmpeg pass
+  turning a few megabytes of compressed audio into hundreds of megabytes
+  of PCM — a file Sipra then decodes and immediately deletes. Every byte
+  of it was wasted work, and reading it back was the step that appeared to
+  stall. The audio is now kept as it arrives; the decoder reads m4a and
+  opus perfectly well.
+- **Neither the decoder nor the metadata probe had a timeout.** This is
+  the same defect that hung an import back in 0.9.1, fixed then in the
+  downloader and left untouched here. A decoder that stopped responding
+  stopped the job with it, for as long as the app stayed open.
+- **The downloader's own deadline was unreachable.** Its timeout sat on
+  the `wait()` after the loop that reads yt-dlp's output, and that loop
+  only ends when yt-dlp closes its output. A download that went quiet
+  without exiting blocked in the read and never arrived at the timeout
+  meant to catch precisely that. Both output streams are drained on their
+  own threads now and the deadline is polled independently — which also
+  means Cancel is noticed within half a second rather than whenever the
+  next line happens to arrive.
+- **MP3 export could wait forever too.** Found by the new audit rather
+  than by anyone hitting it.
+
+### Changed
+
+- **Decoding reports progress and can be cancelled.** libsndfile is read a
+  block at a time; ffmpeg's output is consumed in chunks against the
+  expected size. "Reading the file" now moves, and Cancel works during it
+  instead of waiting it out.
+- The metadata probe also reads the duration, which is what makes the
+  ffmpeg decode's progress a real fraction rather than a guess.
+
+### Tests
+
+- 633 TypeScript tests, 510 Python tests.
+- **A static audit that every subprocess in the package can end.** It
+  fails if any `subprocess.run` omits a timeout, if a file uses `Popen`
+  without declaring that it manages its own deadline, or if a declared
+  file stops enforcing one. This is the test that should have existed in
+  0.9.1: fixing the file that was reported is not the same as fixing the
+  fault, and the gap between those two cost this release.
+- The audit found the MP3 export immediately, and the download loop's
+  unreachable deadline.
+- Block-by-block decoding is pinned sample-for-sample against a
+  single-call read, so reading in pieces cannot quietly alter the audio.
+- A stand-in decoder that produces nothing and never exits, proving the
+  deadline fires; another that floods 512 KB to stderr, proving the
+  drain-on-a-thread rule still holds here.
+
+### A note on the same mistake twice
+
+Writing the audit test caught me reintroducing this exact bug inside the
+fix for it: the first version of the new decode loop checked its deadline
+around a blocking read, which is not a deadline at all. The test hung, as
+it should have.
+
+---
+
 ## [0.9.7] — 2026-08-24
 
 Two reports that turned out to be one fault, plus continuous integration.
