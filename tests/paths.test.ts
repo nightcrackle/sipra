@@ -1,6 +1,11 @@
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import {
+  AUDIO_EXTENSIONS,
   baseNameOf,
   extensionOf,
   hasAudioExtension,
@@ -14,6 +19,8 @@ import {
   trackDirName,
 } from '@shared/paths';
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
 describe('extension helpers', () => {
   it.each(['song.wav', 'SONG.WAV', 'a/b/c.mp3', 'x.flac', 'y.m4a'])(
     'accepts %s as audio',
@@ -22,10 +29,20 @@ describe('extension helpers', () => {
     },
   );
 
-  it.each(['notes.txt', 'video.mp4', 'archive.zip', 'noextension', 'song.wav.txt'])(
+  it.each(['notes.txt', 'photo.jpg', 'archive.zip', 'noextension', 'song.wav.txt'])(
     'rejects %s',
     (path) => {
       expect(hasAudioExtension(path)).toBe(false);
+    },
+  );
+
+  it.each(['audio.webm', 'video.mp4', 'book.m4b', 'x.mka'])(
+    'accepts %s, because a download arrives in a container',
+    (path) => {
+      // Sipra takes the audio stream out of these. They were refused while
+      // every download was forced to WAV and nothing else ever reached
+      // this check.
+      expect(hasAudioExtension(path)).toBe(true);
     },
   );
 
@@ -209,5 +226,52 @@ describe('export naming', () => {
 
   it('copes with an id containing no usable characters', () => {
     expect(trackDirName('Song', '---')).toBe('Song-track');
+  });
+});
+
+describe('extension parity with the Python core', () => {
+  // `AUDIO_EXTENSIONS` here and `SUPPORTED_INPUT_EXTENSIONS` in
+  // `python/sipra_core/audio_io.py` are the same list twice. When they
+  // drift, the engine decodes files the interface refuses to accept, or
+  // the interface accepts files the engine rejects — and the second is a
+  // failed import for something the user was told would work.
+  //
+  // They did drift: the containers a URL download arrives in were added on
+  // the Python side only.
+  //
+  // The real Python is executed rather than its source pattern-matched, so
+  // a refactor on either side cannot make this pass falsely.
+  const pythonDir = path.join(repoRoot, 'python');
+
+  function readPythonExtensions(): string[] | null {
+    const script =
+      'import json; from sipra_core.audio_io import SUPPORTED_INPUT_EXTENSIONS; '
+      + 'print(json.dumps(list(SUPPORTED_INPUT_EXTENSIONS)))';
+    for (const interpreter of ['python3', 'python']) {
+      try {
+        const output = execFileSync(interpreter, ['-c', script], {
+          cwd: pythonDir,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        return JSON.parse(output) as string[];
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  const pythonExtensions = readPythonExtensions();
+  const runIf = pythonExtensions ? it : it.skip;
+
+  runIf('accepts exactly the same extensions', () => {
+    expect(pythonExtensions).not.toBeNull();
+    expect([...(pythonExtensions ?? [])].sort()).toEqual([...AUDIO_EXTENSIONS].sort());
+  });
+
+  runIf('accepts the container a YouTube download usually arrives in', () => {
+    expect(pythonExtensions).toContain('.webm');
+    expect(hasAudioExtension('Song [HQ AUDIO].webm')).toBe(true);
   });
 });

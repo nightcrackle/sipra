@@ -44,6 +44,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e "./python[dev]"
 
+      # The format tests decode real m4a, opus, webm, ogg, mp3 and flac —
+      # the path every URL import takes, and the one that had no coverage
+      # at all until two releases shipped broken through the gap. They skip
+      # themselves without ffmpeg, so this makes a silent skip visible
+      # rather than letting it pass for a green run.
+      - name: Confirm ffmpeg is present for the decode tests
+        shell: bash
+        run: |
+          if command -v ffmpeg >/dev/null 2>&1; then
+            ffmpeg -version | head -1
+          else
+            echo "::warning::ffmpeg not found — the real-format decode tests will skip"
+          fi
+
       - name: Lint
         run: python -m ruff check python
 

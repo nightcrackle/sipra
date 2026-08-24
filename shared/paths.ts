@@ -6,6 +6,18 @@
  * renderer asked for".
  */
 
+/**
+ * Extensions Sipra will open.
+ *
+ * The mirror of `SUPPORTED_INPUT_EXTENSIONS` in
+ * `python/sipra_core/audio_io.py`; a parity test keeps the two identical.
+ * They had drifted: the containers a URL download arrives in were added on
+ * the Python side, which meant the engine would happily decode a file that
+ * drag-and-drop refused to accept.
+ *
+ * The last five are containers rather than audio formats. Sipra takes the
+ * audio stream out of them, which is what a YouTube download is.
+ */
 export const AUDIO_EXTENSIONS: readonly string[] = [
   '.wav',
   '.mp3',
@@ -18,6 +30,11 @@ export const AUDIO_EXTENSIONS: readonly string[] = [
   '.aiff',
   '.aif',
   '.wma',
+  '.webm',
+  '.mp4',
+  '.m4b',
+  '.mka',
+  '.mkv',
 ];
 
 /** Characters Windows rejects in a filename, plus control characters. */

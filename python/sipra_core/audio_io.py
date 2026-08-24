@@ -30,7 +30,7 @@ import numpy as np
 import soundfile as sf
 
 from .errors import CancelledError, ErrorCode, SipraError
-from .trace import trace
+from .trace import Throttle, trace
 
 
 class Cancellable(Protocol):
@@ -61,6 +61,19 @@ FFPROBE_TIMEOUT_SECONDS = 30
 #: deadline. Short enough that Cancel feels immediate.
 DECODE_POLL_SECONDS = 0.25
 
+#: How long a decoder may produce nothing at all before it is given up on.
+#:
+#: The wall-clock ceiling above is generous because a legitimately long
+#: decode is legitimately long. This is the other question, and the more
+#: useful one: a decoder that has stopped producing output has stopped,
+#: whatever its total budget says. Waiting out fifteen minutes to find that
+#: out helps nobody.
+DECODE_STALL_SECONDS = 120
+
+#: How often a decoder in progress says so, in seconds. Turns "it stopped
+#: somewhere in decoding" into a line naming how far it got.
+DECODE_HEARTBEAT_SECONDS = 5.0
+
 # Extensions we advertise in the UI's file picker.
 SUPPORTED_INPUT_EXTENSIONS: tuple[str, ...] = (
     ".wav",
@@ -74,6 +87,18 @@ SUPPORTED_INPUT_EXTENSIONS: tuple[str, ...] = (
     ".aiff",
     ".aif",
     ".wma",
+    # Containers a URL download can arrive in.
+    #
+    # Sipra used to force every download to WAV, so only the formats a
+    # person would drop in by hand needed listing. Now the audio is kept as
+    # it comes, and YouTube's best audio stream is very often Opus inside
+    # WebM — which the decoder reads perfectly well and the extension check
+    # was refusing outright.
+    ".webm",
+    ".mp4",
+    ".m4b",
+    ".mka",
+    ".mkv",
 )
 
 # Beyond this we refuse rather than exhaust memory on a mis-drop.
@@ -273,6 +298,7 @@ def _load_with_soundfile(
         # One allocation for the result; blocks are read straight into it.
         out = np.empty((frames, channels), dtype=np.float32)
         position = 0
+        heartbeat = Throttle(DECODE_HEARTBEAT_SECONDS)
         while position < frames:
             if token is not None and token.cancelled:
                 raise CancelledError("Decoding cancelled")
@@ -288,6 +314,8 @@ def _load_with_soundfile(
             position += got
             if on_progress:
                 on_progress(position / frames)
+            if heartbeat.ready():
+                trace("libsndfile still reading", frame=position, of=frames)
 
     # soundfile yields (frames, channels); the core wants (channels, frames).
     return np.ascontiguousarray(out.T), rate
@@ -410,6 +438,10 @@ def _run_streaming(
 
     chunks: list[bytes] = []
     counter = {"read": 0}
+    # Written by the pump, read by the poll loop. A plain float assignment
+    # is atomic enough for a liveness check.
+    last_byte_at = {"when": time.monotonic()}
+    pump_error: list[BaseException] = []
 
     # stdout is read on its own thread as well.
     #
@@ -421,17 +453,35 @@ def _run_streaming(
     def _pump() -> None:
         if proc.stdout is None:
             return
+        heartbeat = Throttle(DECODE_HEARTBEAT_SECONDS)
+        # `read1` returns whatever has arrived, up to the limit. `read`
+        # waits for the full amount, which means a decoder trickling data
+        # registers as producing nothing until a whole megabyte has piled
+        # up — so progress lurches, and the liveness check below would
+        # eventually call a working decoder stalled.
+        read_available = getattr(proc.stdout, "read1", proc.stdout.read)
         try:
             while True:
-                chunk = proc.stdout.read(DECODE_CHUNK_BYTES)
+                chunk = read_available(DECODE_CHUNK_BYTES)
                 if not chunk:
                     return
                 chunks.append(chunk)
                 counter["read"] += len(chunk)
+                last_byte_at["when"] = time.monotonic()
                 if on_progress and expected_bytes > 0:
                     on_progress(min(0.99, counter["read"] / expected_bytes))
-        except Exception:  # pragma: no cover - stream closed under us
-            pass
+                if heartbeat.ready():
+                    trace(
+                        f"{label} still decoding",
+                        readMb=round(counter["read"] / 1024 / 1024, 1),
+                        ofMb=round(expected_bytes / 1024 / 1024, 1) if expected_bytes else None,
+                    )
+        except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised below
+            # A pump that dies quietly is the worst outcome available: with
+            # nothing draining stdout the decoder blocks writing, and the
+            # poll loop below waits out its entire budget for a process
+            # that will never finish. Recorded so the caller can say so.
+            pump_error.append(exc)
 
     pump = threading.Thread(target=_pump, name=f"{label}-stdout", daemon=True)
     pump.start()
@@ -442,7 +492,31 @@ def _run_streaming(
             if token is not None and token.cancelled:
                 proc.kill()
                 raise CancelledError(f"{label} cancelled")
-            if time.monotonic() > deadline:
+
+            if pump_error:
+                proc.kill()
+                raise SipraError(
+                    ErrorCode.DECODE_FAILED,
+                    f"{label}'s output could not be read: {pump_error[0]}",
+                    {"bytesRead": counter["read"]},
+                )
+
+            now = time.monotonic()
+            silent_for = now - last_byte_at["when"]
+            if silent_for > DECODE_STALL_SECONDS:
+                proc.kill()
+                raise SipraError(
+                    ErrorCode.DECODE_FAILED,
+                    f"{label} stopped producing output after "
+                    f"{counter['read'] // (1024 * 1024)} MB and did not resume "
+                    f"within {DECODE_STALL_SECONDS} seconds.",
+                    {
+                        "bytesRead": counter["read"],
+                        "silentForSeconds": int(silent_for),
+                        "expectedBytes": expected_bytes,
+                    },
+                )
+            if now > deadline:
                 proc.kill()
                 raise SipraError(
                     ErrorCode.DECODE_FAILED,

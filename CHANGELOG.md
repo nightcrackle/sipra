@@ -12,6 +12,78 @@ real hardware.
 
 ---
 
+## [0.9.10] — 2026-08-24
+
+Another import stuck on "Reading the file", this time with no log to read.
+
+Every realistic download format was decoded here first — m4a, opus, WebM,
+Ogg, MP3, FLAC — and all six worked. So this release does not claim to
+have found the cause. It closes the two real gaps that inspection did
+turn up, and makes the next occurrence explain itself instead of going
+quiet.
+
+### Fixed
+
+- **WebM was refused outright.** YouTube's best audio stream is very often
+  Opus inside WebM, and `.webm` was not on the list of extensions Sipra
+  accepts — nor were `.mp4`, `.m4b`, `.mka` or `.mkv`. The decoder reads
+  all of them; only the extension check turned them away. It never
+  mattered while every download was forced to WAV, and started mattering
+  the moment that stopped.
+- **The two extension lists had drifted.** TypeScript and Python keep the
+  same list twice, and only one of them was updated. The engine would have
+  decoded a file that drag-and-drop refused to accept. There is a parity
+  test now, running the real Python rather than reading its source, in the
+  same shape as the one that guards the stem vocabulary.
+- **A decoder trickling data was miscounted as producing none.** The read
+  asked for a full megabyte and waited for it, so a slow decoder
+  registered as silent until a whole chunk piled up — which made progress
+  lurch and would eventually have had the new stall detector accuse a
+  working decoder. It now takes whatever has arrived.
+
+### Added
+
+- **A stall detector.** The overall ceiling stays generous, because a long
+  decode is legitimately long. Producing nothing at all is a different
+  question with a much shorter answer: two minutes of complete silence and
+  the decoder is given up on, with a message saying how far it got. Better
+  than waiting out fifteen minutes to learn the same thing.
+- **A heartbeat inside both decoders**, every five seconds, naming how far
+  each has read. The last log stopped at "decoding <name>" and said
+  nothing more; that gap is now filled from the inside.
+- **A decoder whose output cannot be read is reported, not waited out.**
+  If the thread draining the decoder's output dies, nothing is consuming
+  it, so the decoder blocks writing and the job waits out its entire
+  budget for a process that will never finish. That failure now surfaces
+  immediately with the reason attached.
+
+### Tests
+
+- 639 TypeScript tests, 563 Python tests.
+- **Real files in every format a download arrives in**, built with ffmpeg
+  and put through the decoder unchanged — including under a bracketed
+  title, since that is what broke the previous release. Correctness is
+  checked by finding the tone in the spectrum rather than by measuring
+  level: a non-zero peak proves only that bytes arrived, whereas the tone
+  being where it was put proves the decode was right.
+  **This coverage did not exist before.** Every existing test fed the
+  decoder a WAV, so the ffmpeg path — the one every URL import now takes —
+  had never been exercised with a real compressed file. Two releases
+  shipped broken through that gap.
+- Truncated files, files of pure noise, and cancellation mid-decode.
+- The stall detector, and its counter-case: steady slow output must not be
+  mistaken for a stall.
+- CI now says out loud when ffmpeg is missing, so these tests skipping
+  cannot quietly pass for a green run.
+
+### Still open
+
+If it stalls again, the log will now name the decoder, how many megabytes
+it had read, and how long it sat — or the stall detector will have already
+turned it into an error saying so. That is the report worth sending.
+
+---
+
 ## [0.9.9] — 2026-08-24
 
 "The download finished but no audio file was produced." It had been

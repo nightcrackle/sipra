@@ -97,7 +97,7 @@ class TestValidateInput:
             local.validate_input(tmp_path)
         assert info.value.code == ErrorCode.UNSUPPORTED_FORMAT
 
-    @pytest.mark.parametrize("name", ["notes.txt", "video.mp4", "archive.zip", "noext"])
+    @pytest.mark.parametrize("name", ["notes.txt", "archive.zip", "noext", "photo.jpg"])
     def test_rejects_an_unsupported_extension(self, tmp_path, name):
         path = tmp_path / name
         path.write_bytes(b"data")
@@ -105,6 +105,25 @@ class TestValidateInput:
             local.validate_input(path)
         assert info.value.code == ErrorCode.UNSUPPORTED_FORMAT
         assert "supported" in info.value.details
+
+    @pytest.mark.parametrize("name", ["audio.webm", "audio.mp4", "audio.mka", "audio.m4b"])
+    def test_accepts_the_containers_a_download_arrives_in(self, tmp_path, name):
+        """These used to be refused, and used not to matter.
+
+        While every download was forced to WAV, only formats a person might
+        drop in by hand needed listing. The audio is kept as it comes now,
+        and YouTube's best audio stream is very often Opus inside WebM. The
+        decoder reads all of these; the extension check was the only thing
+        turning them away.
+        """
+        path = tmp_path / name
+        path.write_bytes(b"data")
+        # Not a real media file, so it fails on content rather than on its
+        # name — which is the distinction being tested.
+        try:
+            local.validate_input(path)
+        except SipraError as exc:
+            assert exc.code != ErrorCode.UNSUPPORTED_FORMAT or "supported" not in exc.details
 
     def test_rejects_an_empty_file(self, tmp_path):
         path = tmp_path / "empty.wav"
