@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { decodePeaks } from '@shared/peaks';
 import { Sidecar, SidecarError } from '../electron/services/sidecar';
@@ -45,6 +45,32 @@ function findPython(): string | null {
 
 const python = findPython();
 const describeIf = python ? describe : describe.skip;
+
+/**
+ * Budgets for a slow runner, not for this machine.
+ *
+ * A Windows CI runner is roughly ten times slower here than a developer
+ * machine, and the first analysis in a fresh process additionally compiles
+ * part of librosa — tens of seconds on its own. Budgets tuned locally
+ * turned that into seven failures, only one of which was a real fault: the
+ * first `separate` overran, and because heavy work runs one at a time in
+ * the engine, everything after it queued behind a job nobody was waiting
+ * for any more.
+ *
+ * These are deliberately generous. A test that fails only on the slowest
+ * supported platform teaches nothing except to distrust the suite.
+ */
+const SHORT = 60_000;
+const LONG = 300_000;
+const WARMUP = 600_000;
+
+// Every test in this file talks to a real process over a real pipe, so
+// none of them belong on the default five-second budget. Three of the
+// seven CI failures were tests that do nothing but check an argument is
+// rejected — they simply never got a turn inside five seconds while the
+// engine was busy. Individual `it` timeouts still raise this where a test
+// genuinely needs longer.
+vi.setConfig({ testTimeout: SHORT, hookTimeout: WARMUP });
 
 describeIf('sidecar integration', () => {
   let workspace: string;
@@ -80,7 +106,14 @@ describeIf('sidecar integration', () => {
       env: { SIPRA_ENABLE_FIXTURE_ENGINE: '1' },
     });
     await sidecar.start();
-  }, 120_000);
+
+    // Pay the analysis stage's compile cost here rather than inside a
+    // test that is measuring something else. This is the same warm-up
+    // setup performs on a user's machine, and for the same reason.
+    await sidecar
+      .request('models.prepare', { engine: 'fixture', warmup: true }, WARMUP)
+      .catch(() => undefined);
+  }, WARMUP);
 
   afterAll(async () => {
     await sidecar?.stop();
@@ -177,7 +210,7 @@ describeIf('sidecar integration', () => {
           analyse: true,
           jobId: 'e2e-job',
         },
-        180_000,
+        LONG,
       );
 
       expect(outcome.stems.map((stem) => stem.id)).toEqual(['vocals', 'drums', 'bass', 'other']);
@@ -195,7 +228,7 @@ describeIf('sidecar integration', () => {
     } finally {
       sidecar.off('progress', onProgress);
     }
-  }, 180_000);
+  }, LONG);
 
   it('writes peak files the TypeScript decoder can read', async () => {
     // The binary layout is defined in Python and parsed in TypeScript;
@@ -225,12 +258,12 @@ describeIf('sidecar integration', () => {
         format: 'wav',
         bitDepth: 24,
       },
-      120_000,
+      LONG,
     );
 
     expect(result.stemCount).toBe(2);
     await expect(fs.access(result.path)).resolves.toBeUndefined();
-  }, 120_000);
+  }, LONG);
 
   it('refuses a URL import without the rights confirmation', async () => {
     try {
@@ -283,10 +316,10 @@ describeIf('sidecar integration', () => {
       180_000,
     );
 
-    const pong = await sidecar.request<{ pong: boolean }>('ping', {}, 30_000);
+    const pong = await sidecar.request<{ pong: boolean }>('ping', {}, SHORT);
     expect(pong.pong).toBe(true);
     await job;
-  }, 180_000);
+  }, LONG);
 });
 
 /**
@@ -317,7 +350,7 @@ describeIf('cancelling a job that will not stop', () => {
       cancelGraceMs: 1500,
     });
     await wedged.start();
-  }, 120_000);
+  }, LONG);
 
   afterAll(async () => {
     await wedged?.stop();
@@ -328,7 +361,7 @@ describeIf('cancelling a job that will not stop', () => {
     const restarts: string[] = [];
     wedged.on('restarting', ({ reason }: { reason: string }) => restarts.push(reason));
 
-    const stuck = wedged.request('debug.wedge', { jobId: 'wedged-job', seconds: 120 }, 300_000);
+    const stuck = wedged.request('debug.wedge', { jobId: 'wedged-job', seconds: 120 }, LONG);
     // Let it reach the worker before cancelling.
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(wedged.hasPendingFor('wedged-job')).toBe(true);
@@ -343,9 +376,9 @@ describeIf('cancelling a job that will not stop', () => {
 
     // And the engine works again — which is the whole point. Before this,
     // one wedged job ended the session.
-    const pong = await wedged.request<{ pong: boolean }>('ping', {}, 60_000);
+    const pong = await wedged.request<{ pong: boolean }>('ping', {}, SHORT);
     expect(pong.pong).toBe(true);
-  }, 120_000);
+  }, LONG);
 
   it('runs a real job after a restart', async () => {
     const outcome = await wedged.request<{ stems: unknown[] }>(
@@ -361,16 +394,44 @@ describeIf('cancelling a job that will not stop', () => {
       180_000,
     );
     expect(outcome.stems).toHaveLength(4);
-  }, 180_000);
+  }, LONG);
+
+  it('frees the engine when a caller gives up waiting', async () => {
+    // Giving up on an answer does not stop the work. Heavy methods run one
+    // at a time, so a request abandoned by its caller used to leave the
+    // engine occupied and every later job queued behind one nobody wanted
+    // any more. That is what turned a single slow test into seven failures
+    // in CI. A timed-out request now cancels its own job.
+    const restarts: string[] = [];
+    wedged.on('restarting', ({ reason }: { reason: string }) => restarts.push(reason));
+
+    await expect(
+      wedged.request(
+        'debug.wedge',
+        { jobId: 'abandoned', seconds: 120, ignoreCancel: false },
+        2_000,
+      ),
+    ).rejects.toMatchObject({ code: 'SIDECAR_TIMEOUT' });
+
+    // The proof: the next job runs promptly instead of queueing behind a
+    // two-minute sleep nobody is waiting for.
+    const started = Date.now();
+    const pong = await wedged.request<{ pong: boolean }>('debug.wedge', { seconds: 0.1 }, SHORT);
+    expect(pong).toBeTruthy();
+    expect(Date.now() - started).toBeLessThan(30_000);
+
+    // And it was freed by cancelling, not by killing the engine.
+    expect(restarts).toHaveLength(0);
+  }, LONG);
 
   it('does not restart when the job stops on its own', async () => {
     const restarts: string[] = [];
     wedged.on('restarting', ({ reason }: { reason: string }) => restarts.push(reason));
     // Short enough to finish inside the grace period.
-    await wedged.request('debug.wedge', { jobId: 'brief', seconds: 0.2 }, 30_000);
+    await wedged.request('debug.wedge', { jobId: 'brief', seconds: 0.2 }, SHORT);
     expect(await wedged.cancel('brief')).toBe(true);
     expect(restarts).toHaveLength(0);
-  }, 60_000);
+  }, LONG);
 });
 
 /** Write the shared test signal into `dir` once, returning its path. */

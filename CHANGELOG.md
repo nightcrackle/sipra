@@ -12,6 +12,64 @@ real hardware.
 
 ---
 
+## [0.9.12] — 2026-08-25
+
+Ten test failures on Windows CI. One was a real fault, one was a real bug
+in shipped code, and the remaining eight were consequences of the first.
+
+### Fixed
+
+- **Abandoning a request left the engine occupied.** Heavy methods run one
+  at a time on purpose, and a request whose caller gave up waiting kept
+  running — so every later job queued behind one nobody wanted any more.
+  In CI that turned a single overrunning test into six more failures; in
+  the app it means a job that overran its budget quietly blocks everything
+  after it. A timed-out request now cancels its own job. Verified by
+  disabling the fix and watching the test fail: 63 seconds without it, 2
+  with.
+- **A path check compared two paths in different forms.** The asset was
+  resolved, the workspace it was checked against was not. On Windows
+  `resolve` turns a root-relative path into a drive-qualified one, so a
+  file genuinely inside the workspace stopped looking like it was. Both
+  sides are resolved now. In production both arrive absolute and native so
+  this never showed — it took a Windows run to expose the asymmetry.
+
+### Changed
+
+- **Setup warms the analysis stage as well as the model.** Tempo and key
+  detection compile part of librosa on first use — tens of seconds on a
+  cold machine, and it landed at the very end of the user's first
+  separation, which is the least forgivable place for an unexplained
+  pause. Setup absorbs it, the same as the model download.
+- **Integration test budgets are set for the slowest supported platform.**
+  A Windows runner is roughly ten times slower here than a developer
+  machine. Budgets tuned locally produced failures that taught nothing
+  except to distrust the suite. Three of the ten failures were tests that
+  do nothing but check an argument is rejected — they never got a turn
+  inside the default five seconds while the engine was busy.
+
+### Tests
+
+- 640 TypeScript tests, 573 Python tests.
+- The abandoned-request case is now covered end to end, through a real
+  process over a real pipe: a caller gives up, and the next job has to run
+  promptly rather than queueing — and the engine must be freed by
+  cancelling, not by being killed and restarted.
+- The test-only wedge method gained a cancellable mode, so both halves are
+  reproducible: work that ignores cancellation, which only a restart can
+  reclaim, and ordinary long work, which a cancel should end.
+- The media fixture builds paths rather than hard-coding POSIX literals,
+  so it means the same thing on both platforms.
+
+### Note
+
+The reported import problem is still not explained. Nothing here claims to
+fix it. What this does fix is a mechanism that would make any single stuck
+job look like a wholly broken application, which is worth removing on its
+own merits.
+
+---
+
 ## [0.9.11] — 2026-08-25
 
 The Windows CI failures and the import failures were the same problem

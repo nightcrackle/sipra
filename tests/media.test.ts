@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { mediaUrl } from '@shared/ipc';
@@ -11,7 +13,15 @@ import {
   resolveMediaPath,
 } from '../electron/services/media';
 
-const WORKSPACE = '/ws';
+// Native paths, built rather than written.
+//
+// Hard-coded POSIX literals passed through `path.resolve` on Windows come
+// back drive-qualified, so the asset stopped looking like it was inside the
+// workspace and three tests failed there and nowhere else. Deriving both
+// from the same `resolve` keeps the fixture honest on either platform.
+const WORKSPACE = path.resolve('/ws');
+const TRACK_DIR = path.join(WORKSPACE, 'tracks', 'song');
+const inTrack = (...parts: string[]): string => path.join(TRACK_DIR, ...parts);
 
 const track: Track = {
   id: 'track-1',
@@ -20,9 +30,9 @@ const track: Track = {
   createdAt: 0,
   updatedAt: 0,
   folderId: null,
-  trackDir: '/ws/tracks/song',
-  sourcePath: '/ws/tracks/song/source.wav',
-  sourcePeaksPath: '/ws/tracks/song/peaks/source.speaks',
+  trackDir: TRACK_DIR,
+  sourcePath: inTrack('source.wav'),
+  sourcePeaksPath: inTrack('peaks', 'source.speaks'),
   originalFileName: 'song.mp3',
   sourceUrl: null,
   fingerprint: null,
@@ -35,8 +45,8 @@ const track: Track = {
   stems: [
     {
       id: 'vocals',
-      audioPath: '/ws/tracks/song/stems/vocals.wav',
-      peaksPath: '/ws/tracks/song/peaks/vocals.speaks',
+      audioPath: inTrack('stems', 'vocals.wav'),
+      peaksPath: inTrack('peaks', 'vocals.speaks'),
       samplePeakDb: -1,
       rmsDb: -14,
     },
@@ -112,7 +122,7 @@ describe('resolveMediaPath', () => {
       library,
       WORKSPACE,
     );
-    expect(resolved.filePath).toBe('/ws/tracks/song/source.wav');
+    expect(resolved.filePath).toBe(inTrack('source.wav'));
     expect(resolved.contentType).toBe('audio/wav');
   });
 
@@ -122,21 +132,21 @@ describe('resolveMediaPath', () => {
       library,
       WORKSPACE,
     );
-    expect(resolved.filePath).toBe('/ws/tracks/song/peaks/source.speaks');
+    expect(resolved.filePath).toBe(inTrack('peaks', 'source.speaks'));
   });
 
   it('resolves a stem and its peaks', () => {
     expect(
       resolveMediaPath({ trackId: 'track-1', kind: 'stem', stemId: 'vocals' }, library, WORKSPACE)
         .filePath,
-    ).toBe('/ws/tracks/song/stems/vocals.wav');
+    ).toBe(inTrack('stems', 'vocals.wav'));
     expect(
       resolveMediaPath(
         { trackId: 'track-1', kind: 'peaks-stem', stemId: 'vocals' },
         library,
         WORKSPACE,
       ).filePath,
-    ).toBe('/ws/tracks/song/peaks/vocals.speaks');
+    ).toBe(inTrack('peaks', 'vocals.speaks'));
   });
 
   it('rejects an unknown track', () => {

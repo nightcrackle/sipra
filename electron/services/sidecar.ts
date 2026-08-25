@@ -344,9 +344,19 @@ export class Sidecar extends EventEmitter {
     };
 
     return new Promise<T>((resolve, reject) => {
+      const jobId = typeof params.jobId === 'string' ? params.jobId : undefined;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         settle('timeout');
+        // Giving up on the answer does not stop the work.
+        //
+        // Heavy methods run one at a time in the engine, so a request
+        // abandoned here leaves that worker occupied and every later job
+        // queued behind one nobody is waiting for any more. Cancelling is
+        // fire-and-forget: it cannot be awaited from inside a timeout, and
+        // a job too deep in a native call to notice will be dealt with by
+        // the restart path instead.
+        if (jobId) void this.sendCancel(jobId);
         reject(
           new SidecarError({
             code: 'SIDECAR_TIMEOUT',
@@ -396,6 +406,22 @@ export class Sidecar extends EventEmitter {
       // below decides whether anything is still running.
     }
     return this.waitForJobToStop(jobId);
+  }
+
+  /**
+   * Ask the engine to stop a job, without waiting for it to confirm.
+   *
+   * Used where the answer is not wanted and cannot be awaited — chiefly
+   * from a request's own timeout handler.
+   */
+  private async sendCancel(jobId: string): Promise<void> {
+    const child = this.child;
+    if (!child || !this.isReady) return;
+    try {
+      child.stdin.write(encodeRequest({ id: randomUUID(), method: 'cancel', params: { jobId } }));
+    } catch {
+      // The engine is already gone, which achieves the same thing.
+    }
   }
 
   /** Whether any request for this job is still outstanding. */

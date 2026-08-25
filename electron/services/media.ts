@@ -110,8 +110,17 @@ export function resolveMediaPath(
 
   if (!filePath) throw new MediaRequestError('Unknown asset', 404);
 
+  // Both sides are resolved, not just the asset.
+  //
+  // Resolving one and not the other means comparing paths in two different
+  // forms, and on Windows those forms differ enough to matter: `resolve`
+  // turns a root-relative path into a drive-qualified one, so a child that
+  // genuinely sits inside the parent no longer looks like it does. In
+  // production both arrive absolute and native and the asymmetry never
+  // showed; it took a Windows test run to expose it.
+  const root = path.resolve(workspaceDir);
   const resolved = path.resolve(filePath);
-  if (!isPathInside(workspaceDir, resolved)) {
+  if (!isPathInside(root, resolved)) {
     throw new MediaRequestError('Asset is outside the workspace', 403);
   }
 

@@ -43,6 +43,7 @@ from .protocol import (
 )
 from .stems import STEM_IDS
 from .stems import describe as describe_stems
+from .trace import trace
 from .waveform import DEFAULT_SAMPLES_PER_BUCKET, compute_peaks, write_peaks
 
 Handler = Callable[["SipraServer", Request], Any]
@@ -410,17 +411,56 @@ def _h_prepare_model(server: SipraServer, request: Request) -> dict:
     job_id = str(optional(request.params, "jobId", str) or request.id)
 
     engine, resolved = server.registry.resolve(engine_id, model_id)
+    report = server._progress_fn(request.id, job_id)
+
     prepare = getattr(engine, "prepare_model", None)
     if prepare is None:
-        return {"prepared": False, "engine": engine.id, "model": resolved,
-                "reason": "This engine needs no preparation."}
+        outcome = {
+            "prepared": False,
+            "engine": engine.id,
+            "model": resolved,
+            "reason": "This engine needs no preparation.",
+        }
+    else:
+        outcome = prepare(
+            resolved,
+            device=optional(request.params, "device", str),
+            warmup=warmup,
+            on_progress=report,
+        )
 
-    return prepare(
-        resolved,
-        device=optional(request.params, "device", str),
-        warmup=warmup,
-        on_progress=server._progress_fn(request.id, job_id),
-    )
+    if warmup:
+        outcome["analysisWarmed"] = _warm_analysis(report)
+    return outcome
+
+
+def _warm_analysis(report: Callable[[str, float], None] | None = None) -> bool:
+    """Pay the analysis stage's cold start during setup.
+
+    Tempo and key detection go through librosa, which compiles parts of
+    itself on first use. That is tens of seconds on a cold machine and it
+    used to land inside the user's first separation, at the very end of the
+    bar — the same shape of unexplained pause as the model download, in the
+    one place a progress bar is least forgivable.
+
+    A second of silence is enough to trigger the compilation. Failure here
+    is not worth reporting: the analysis will simply be slow once instead.
+    """
+    try:
+        import numpy as np
+
+        from .analysis import analyse_buffer
+        from .audio_io import AudioBuffer
+
+        if report:
+            report("model", 0.9)
+        trace("warming the analysis")
+        analyse_buffer(AudioBuffer(data=np.zeros((1, 22050), dtype=np.float32), sample_rate=22050))
+        trace("analysis warm")
+        return True
+    except Exception as exc:  # pragma: no cover - never fails setup
+        trace("analysis warm-up skipped", reason=str(exc)[:120])
+        return False
 
 
 HANDLERS: dict[str, Handler] = {
@@ -456,9 +496,24 @@ def _h_wedge(server: SipraServer, request: Request) -> dict:
     Registered only when the fixture engine is enabled, which is never the
     case in a packaged build.
     """
-    seconds = float(optional(request.params, "seconds", (int, float), 30.0) or 30.0)
-    time.sleep(min(max(seconds, 0.0), 300.0))
-    return {"wedged": True}
+    seconds = min(max(float(optional(request.params, "seconds", (int, float), 30.0) or 30.0), 0.0), 300.0)
+
+    # Two shapes, because there are two things worth reproducing. Ignoring
+    # cancellation stands in for a native call that has stopped responding,
+    # which only a restart can reclaim. Honouring it stands in for ordinary
+    # long work, which a cancel should end — including the cancel sent
+    # automatically when a caller gives up waiting for the answer.
+    if bool(optional(request.params, "ignoreCancel", bool, True)):
+        time.sleep(seconds)
+        return {"wedged": True, "cancellable": False}
+
+    job_id = str(optional(request.params, "jobId", str) or request.id)
+    token = server._register_token(job_id)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        token.raise_if_cancelled()
+        time.sleep(0.05)
+    return {"wedged": True, "cancellable": True}
 
 
 # Methods dispatched to the background worker.
