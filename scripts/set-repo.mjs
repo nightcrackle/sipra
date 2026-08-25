@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const README = path.join(root, 'README.md');
 
-/** `nightcrackle/sipra` from any of the shapes a git remote can take. */
+/** `owner/repo` from any of the shapes a git remote can take. */
 export function parseRemote(url) {
   if (!url) return null;
   const cleaned = url.trim().replace(/\.git$/, '');
@@ -33,7 +33,7 @@ export function parseRemote(url) {
   return `${match.groups.owner}/${match.groups.repo}`;
 }
 
-/** Valid as a GitHub `nightcrackle/sipra` pair. */
+/** Valid as a GitHub `owner/repo` pair. */
 export function isRepoSlug(value) {
   return /^[A-Za-z0-9][A-Za-z0-9-_.]*\/[A-Za-z0-9][A-Za-z0-9-_.]*$/.test(value ?? '');
 }
@@ -70,7 +70,7 @@ function main() {
   if (!isRepoSlug(slug)) {
     console.error(
       slug
-        ? `Not a valid nightcrackle/sipra: ${slug}`
+        ? `Not a valid owner/repo: ${slug}`
         : 'No repository given and no origin remote found.\n' +
             'Usage: npm run set-repo -- your-username/sipra',
     );
