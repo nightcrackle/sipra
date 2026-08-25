@@ -263,6 +263,13 @@ def analyse_file_bounded(
             label="analysis",
             on_stderr_line=relay,
             env=child_env,
+            # An explicit directory rather than whatever the caller happens
+            # to be in. A child inherits the parent's working directory, so
+            # inheriting a temporary one means the child holds it open —
+            # and on Windows a directory in use by any process cannot be
+            # removed. Pointing it at the package's own root removes both
+            # the dependency and the hold.
+            cwd=package_root,
         )
     except FileNotFoundError:  # pragma: no cover - no interpreter to re-run
         trace("could not start an analysis child, measuring in process")

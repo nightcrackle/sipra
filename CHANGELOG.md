@@ -12,6 +12,51 @@ real hardware.
 
 ---
 
+## [0.9.16] — 2026-08-25
+
+Windows CI, and a test of mine that could only ever have passed on Linux.
+
+`test_the_child_does_not_depend_on_the_working_directory` changed into a
+temporary directory and then let that directory delete itself. Windows
+refuses to remove a directory that is any process's working directory, and
+it was two processes': this one, until the fixture teardown that comes
+later, and the analysis child, which inherits it.
+
+### Fixed
+
+- **The test uses a directory nothing deletes underneath it.** pytest's
+  own, rather than a self-deleting one.
+- **The analysis child is given an explicit working directory** instead of
+  inheriting the caller's. It never needed the caller's — the import path
+  it actually depends on has been handed to it since 0.9.15 — and
+  inheriting one means holding it open. That is the product half of the
+  same fault, and the one that would have bitten a user whose imports ran
+  from a directory they later removed.
+- **A killed process is now waited for.** Killing only asks; until the
+  process is reaped it still exists, and a process that still exists still
+  holds its open files and its working directory. Every kill site — the
+  decoder's deadline, its stall detector, cancellation, and the
+  downloader's — now reaps, which removes a whole family of failures where
+  cleanup fails on something that was supposed to be dead.
+
+### Tests
+
+- 644 TypeScript tests, 587 Python tests.
+- A test that the child does not hold the caller's directory open: run
+  analysis from a directory, then delete that directory.
+
+### Note on the badges
+
+The badge images stay blank until the URLs point at a real repository:
+
+```bash
+npm run set-repo -- your-username/sipra
+```
+
+They carry the owner and repository name, which cannot be known from here.
+
+---
+
 ## [0.9.15] — 2026-08-25
 
 The decode fix in 0.9.14 worked: the import now gets past 32% and through

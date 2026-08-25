@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..audio_io import SUPPORTED_INPUT_EXTENSIONS
+from ..audio_io import SUPPORTED_INPUT_EXTENSIONS, kill_and_reap
 from ..engines.base import CancellationToken
 from ..errors import CancelledError, ErrorCode, SipraError
 from ..trace import trace
@@ -653,10 +653,10 @@ def download_audio(
     try:
         while True:
             if token is not None and token.cancelled:
-                proc.kill()
+                kill_and_reap(proc, "yt-dlp")
                 raise CancelledError("Download cancelled")
             if time.monotonic() > deadline:
-                proc.kill()
+                kill_and_reap(proc, "yt-dlp")
                 raise SipraError(
                     ErrorCode.DOWNLOAD_FAILED,
                     f"The download did not finish within "

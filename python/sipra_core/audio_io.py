@@ -449,6 +449,26 @@ def _load_with_ffmpeg(
     return np.ascontiguousarray(interleaved.T.astype(np.float32)), sr
 
 
+def kill_and_reap(proc: subprocess.Popen, label: str = "child") -> None:
+    """Kill a process and wait for the operating system to let it go.
+
+    Killing only asks. Until the process is reaped it still exists, and on
+    Windows a process that still exists still holds its open files and its
+    working directory — so a caller that kills a decoder and immediately
+    tries to delete what it was reading gets "the file is being used by
+    another process". Waiting briefly costs nothing and removes a whole
+    family of teardown failures.
+    """
+    try:
+        proc.kill()
+    except Exception:  # pragma: no cover - already gone
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # pragma: no cover - refuses to die; nothing more to do
+        trace(f"{label} did not exit after being killed")
+
+
 def run_bounded(
     cmd: list[str],
     expected_bytes: int,
@@ -458,6 +478,7 @@ def run_bounded(
     label: str,
     on_stderr_line: Callable[[str], None] | None = None,
     env: dict[str, str] | None = None,
+    cwd: str | None = None,
 ) -> tuple[bytes, str]:
     """Run a command, reading stdout in chunks against a deadline.
 
@@ -484,6 +505,7 @@ def run_bounded(
         # Never inherit the sidecar's stdin; see ingest/youtube.py.
         stdin=subprocess.DEVNULL,
         env=env,
+        cwd=cwd,
         creationflags=_creation_flags(),
     )
 
@@ -562,11 +584,11 @@ def run_bounded(
     try:
         while True:
             if token is not None and token.cancelled:
-                proc.kill()
+                kill_and_reap(proc, label)
                 raise CancelledError(f"{label} cancelled")
 
             if pump_error:
-                proc.kill()
+                kill_and_reap(proc, label)
                 raise SipraError(
                     ErrorCode.DECODE_FAILED,
                     f"{label}'s output could not be read: {pump_error[0]}",
@@ -576,7 +598,7 @@ def run_bounded(
             now = time.monotonic()
             silent_for = now - last_byte_at["when"]
             if silent_for > DECODE_STALL_SECONDS:
-                proc.kill()
+                kill_and_reap(proc, label)
                 raise SipraError(
                     ErrorCode.DECODE_FAILED,
                     f"{label} stopped producing output after "
@@ -589,7 +611,7 @@ def run_bounded(
                     },
                 )
             if now > deadline:
-                proc.kill()
+                kill_and_reap(proc, label)
                 raise SipraError(
                     ErrorCode.DECODE_FAILED,
                     f"{label} did not finish within {int(timeout)} seconds.",

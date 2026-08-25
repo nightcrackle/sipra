@@ -8,6 +8,8 @@ Am-Dm-E-Am progression is in A minor.
 
 from __future__ import annotations
 
+import shutil
+
 import numpy as np
 import pytest
 
@@ -373,17 +375,46 @@ class TestBoundedAnalysis:
         with pytest.raises(CancelledError):
             self._bounded(path, token=_Cancelled())
 
-    def test_the_child_does_not_depend_on_the_working_directory(self, wav_file, monkeypatch):
+    def test_the_child_does_not_depend_on_the_working_directory(
+        self, wav_file, tmp_path, monkeypatch
+    ):
         """It imports the package by name, from wherever it is started.
 
         Under a test runner the parent's import path comes from the runner,
         not from the current directory, so a child that relied on the
         directory failed instantly — and would have done the same for any
         caller whose working directory was not the package's own.
-        """
-        import tempfile
 
+        The directory is pytest's own rather than a self-deleting one. A
+        `TemporaryDirectory` removes itself when its block ends, which on
+        Windows fails outright while it is still any process's working
+        directory — and it was two: this one, until the fixture teardown
+        that comes later, and the child, which inherits it.
+        """
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
         path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="cwd.wav")
-        with tempfile.TemporaryDirectory() as elsewhere:
-            monkeypatch.chdir(elsewhere)
-            assert self._bounded(path)["sampleRate"] == 44100
+        monkeypatch.chdir(elsewhere)
+        assert self._bounded(path)["sampleRate"] == 44100
+
+    def test_the_child_does_not_hold_the_callers_directory_open(
+        self, wav_file, tmp_path, monkeypatch
+    ):
+        """A child inherits the parent's working directory unless told not to.
+
+        On Windows a directory in use by any process cannot be removed, so
+        a child left sitting in a caller's temporary directory makes that
+        directory undeletable — which is how this arrived: as a teardown
+        failure with nothing to do with analysis.
+        """
+        elsewhere = tmp_path / "held"
+        elsewhere.mkdir()
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="held.wav")
+        monkeypatch.chdir(elsewhere)
+        self._bounded(path)
+
+        # Back out before removing it, exactly as the product code must not
+        # need to: the point is that nothing else is holding it.
+        monkeypatch.undo()
+        shutil.rmtree(elsewhere)
+        assert not elsewhere.exists()
