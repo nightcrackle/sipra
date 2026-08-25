@@ -1010,6 +1010,7 @@ class TestLocatingTheDownload:
 
         return _locate_output(path)
 
+<<<<<<< HEAD
     def test_the_download_name_contains_nothing_any_layer_reads_as_syntax(self):
         """The property that retires the whole class of fault.
 
@@ -1040,6 +1041,8 @@ class TestLocatingTheDownload:
         assert found is not None
         assert found.name == "Some Track [HQ AUDIO].m4a"
 
+=======
+>>>>>>> f33dc03850ee88ee8ae039c27b51a3dad929f1f0
     @pytest.mark.parametrize(
         "title",
         [
