@@ -2,11 +2,20 @@
 
 Decoding strategy
 -----------------
-1. ``libsndfile`` (via ``soundfile``) handles WAV, FLAC, OGG, AIFF and —
-   with a modern libsndfile — MP3.
-2. Anything libsndfile refuses (M4A/AAC, WMA, exotic MP3s, containers with
-   video streams) falls back to ``ffmpeg``, decoded to 32-bit float PCM on
-   stdout so no temporary file is written.
+Where ffmpeg is available it does the decoding, in a child process, and
+``libsndfile`` is the fallback. That ordering is about what can be
+stopped rather than about audio quality — libsndfile reads WAV, FLAC and
+Ogg perfectly well, but it reads them *inside this process*, and a native
+read that stalls cannot be timed out, cancelled or killed. It stalls the
+only worker there is for as long as the application stays open.
+
+A child process can be given a deadline, watched for having gone quiet,
+and killed. A real import stopped most of the way through a freshly
+downloaded file and sat there for eight minutes, on the in-process path,
+with nothing able to end it.
+
+ffmpeg also resamples while it streams, so a file that needs a rate change
+never has to be held twice.
 
 Audio is represented throughout the core as ``float32`` in shape
 ``(channels, samples)`` — the same layout Demucs expects, which avoids a
@@ -223,26 +232,7 @@ def load_audio(
             on_progress(0.5 * min(1.0, max(0.0, fraction)))
 
     trace("decoder starting", file=p.name, sizeMb=round(size / 1024 / 1024, 1))
-    try:
-        data, sr = _load_with_soundfile(p, on_progress=_decoding, token=token)
-        trace("decoded with libsndfile", rate=sr, frames=int(data.shape[1]))
-    except (SipraError, CancelledError):
-        raise
-    except Exception as sf_exc:
-        trace("libsndfile declined, handing to ffmpeg", reason=str(sf_exc)[:120])
-        try:
-            data, sr = _load_with_ffmpeg(
-                p, target_sample_rate, on_progress=_decoding, token=token
-            )
-            trace("decoded with ffmpeg", rate=sr, frames=int(data.shape[1]))
-        except (SipraError, CancelledError):
-            raise
-        except Exception as ff_exc:  # pragma: no cover - depends on host tools
-            raise SipraError(
-                ErrorCode.DECODE_FAILED,
-                f"Could not decode {p.name}",
-                {"soundfile": str(sf_exc), "ffmpeg": str(ff_exc)},
-            ) from ff_exc
+    data, sr = _decode(p, target_sample_rate, _decoding, token)
 
     buf = AudioBuffer(data=data, sample_rate=sr)
     if buf.duration > MAX_DURATION_SECONDS:
@@ -270,8 +260,81 @@ def load_audio(
     return buf
 
 
+def prefer_subprocess_decoder() -> bool:
+    """Whether to decode in a child process rather than in this one.
+
+    True when ffmpeg is available, unless overridden.
+
+    This is not about which decoder is better at reading audio — libsndfile
+    is perfectly good. It is about what can be stopped. A read inside this
+    process is a native call: it cannot be timed out, cannot be cancelled,
+    and cannot be killed. A read that stalls there stalls the only worker
+    there is, for as long as the application stays open, and no amount of
+    supervision above it can help.
+
+    A child process can be given a deadline, watched for having gone quiet,
+    and killed. That is the whole argument. A real import stopped seventy
+    to a hundred per cent of the way through a freshly downloaded file and
+    sat there for eight minutes — on the one decode path with no way to
+    end it. The same file decoded without complaint on the next attempt,
+    which is what a bounded, retryable decode gives you for free.
+
+    Set ``SIPRA_DECODER=libsndfile`` to force the in-process path back.
+    """
+    choice = os.environ.get("SIPRA_DECODER", "").strip().lower()
+    if choice == "libsndfile":
+        return False
+    if choice == "ffmpeg":
+        return True
+    return ffmpeg_path() is not None
+
+
+def _decode(
+    path: Path,
+    target_sample_rate: int | None,
+    on_progress: Callable[[float], None] | None,
+    token: Cancellable | None,
+) -> tuple[np.ndarray, int]:
+    """Decode with the preferred reader, falling back to the other one."""
+    if prefer_subprocess_decoder():
+        first, second = _load_with_ffmpeg, _load_with_soundfile
+        names = ("ffmpeg", "libsndfile")
+    else:
+        first, second = _load_with_soundfile, _load_with_ffmpeg
+        names = ("libsndfile", "ffmpeg")
+
+    try:
+        data, sr = first(path, target_sample_rate, on_progress=on_progress, token=token)
+        trace(f"decoded with {names[0]}", rate=sr, frames=int(data.shape[1]))
+        return data, sr
+    except CancelledError:
+        raise
+    except Exception as primary:
+        # A stall or a deadline is a fact about this file, not a reason to
+        # try the reader that cannot be stopped. Only a refusal to open the
+        # format is worth a second attempt.
+        if isinstance(primary, SipraError) and primary.code != ErrorCode.DECODE_FAILED:
+            raise
+        trace(f"{names[0]} could not read it, trying {names[1]}", reason=str(primary)[:140])
+
+    try:
+        data, sr = second(path, target_sample_rate, on_progress=on_progress, token=token)
+        trace(f"decoded with {names[1]}", rate=sr, frames=int(data.shape[1]))
+        return data, sr
+    except (SipraError, CancelledError):
+        raise
+    except Exception as secondary:
+        raise SipraError(
+            ErrorCode.DECODE_FAILED,
+            f"Could not decode {path.name}",
+            {names[1]: str(secondary)},
+        ) from secondary
+
+
 def _load_with_soundfile(
     path: Path,
+    _target_sample_rate: int | None = None,
+    *,
     on_progress: Callable[[float], None] | None = None,
     token: Cancellable | None = None,
 ) -> tuple[np.ndarray, int]:
@@ -324,6 +387,7 @@ def _load_with_soundfile(
 def _load_with_ffmpeg(
     path: Path,
     target_sample_rate: int | None = None,
+    *,
     on_progress: Callable[[float], None] | None = None,
     token: Cancellable | None = None,
 ) -> tuple[np.ndarray, int]:

@@ -340,7 +340,10 @@ class TestDecodeReporting:
         buf = load_audio(wav_file(stereo(sine(440, 0.1))))
         assert buf.frames == pytest.approx(4410, abs=2)
 
-    def test_cancellation_is_honoured_partway_through(self, wav_file, monkeypatch):
+    def test_the_in_process_reader_is_cancelled_partway_through(
+        self, wav_file, monkeypatch
+    ):
+        monkeypatch.setenv("SIPRA_DECODER", "libsndfile")
         monkeypatch.setattr(audio_io, "DECODE_BLOCK_FRAMES", 512)
         token = self._Token()
         path = wav_file(stereo(sine(440, 1.0)), name="cancelme.wav")
@@ -350,6 +353,15 @@ class TestDecodeReporting:
 
         with pytest.raises(CancelledError):
             load_audio(path, on_progress=cancel_after_first, token=token)
+
+    def test_the_subprocess_reader_is_cancelled_too(self, wav_file, monkeypatch):
+        if audio_io.ffmpeg_path() is None:
+            pytest.skip("ffmpeg is not installed")
+        monkeypatch.setenv("SIPRA_DECODER", "ffmpeg")
+        token = self._Token(cancelled=True)
+        with pytest.raises(CancelledError):
+            load_audio(wav_file(stereo(sine(440, 0.5))), token=token)
+
 
     def test_an_uncancelled_token_changes_nothing(self, wav_file):
         buf = load_audio(wav_file(stereo(sine(440, 0.2))), token=self._Token())
@@ -490,3 +502,81 @@ class TestDecodeDeadlines:
                 token=_Cancelled(),
                 label="stand-in",
             )
+
+
+class TestDecoderPreference:
+    """Which reader runs, and why.
+
+    Not a question about audio quality — libsndfile reads WAV, FLAC and Ogg
+    perfectly well. It is a question about what can be stopped. libsndfile
+    reads inside this process, and a native read that stalls cannot be
+    timed out, cancelled or killed; it holds the only worker there is for
+    as long as the application stays open. A child process can be given a
+    deadline, watched, and killed. A real import stalled seventy per cent
+    of the way through a freshly downloaded file and sat there for eight
+    minutes, on the in-process path, with nothing able to end it.
+    """
+
+    def test_prefers_the_subprocess_when_ffmpeg_is_available(self, monkeypatch):
+        monkeypatch.delenv("SIPRA_DECODER", raising=False)
+        monkeypatch.setattr(audio_io, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+        assert audio_io.prefer_subprocess_decoder() is True
+
+    def test_falls_back_in_process_when_ffmpeg_is_missing(self, monkeypatch):
+        monkeypatch.delenv("SIPRA_DECODER", raising=False)
+        monkeypatch.setattr(audio_io, "ffmpeg_path", lambda: None)
+        assert audio_io.prefer_subprocess_decoder() is False
+
+    @pytest.mark.parametrize("value,expected", [("libsndfile", False), ("ffmpeg", True)])
+    def test_can_be_forced_either_way(self, monkeypatch, value, expected):
+        monkeypatch.setenv("SIPRA_DECODER", value)
+        monkeypatch.setattr(audio_io, "ffmpeg_path", lambda: None if expected else "/x")
+        assert audio_io.prefer_subprocess_decoder() is expected
+
+    def test_an_unrecognised_setting_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("SIPRA_DECODER", "nonsense")
+        monkeypatch.setattr(audio_io, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+        assert audio_io.prefer_subprocess_decoder() is True
+
+    def test_both_readers_produce_the_same_audio(self, wav_file, monkeypatch):
+        """The preference must not change what the user hears."""
+        if audio_io.ffmpeg_path() is None:
+            pytest.skip("ffmpeg is not installed")
+        path = wav_file(stereo(sine(440, 0.5) * 0.6), name="both.wav")
+
+        monkeypatch.setenv("SIPRA_DECODER", "libsndfile")
+        native = load_audio(path)
+        monkeypatch.setenv("SIPRA_DECODER", "ffmpeg")
+        piped = load_audio(path)
+
+        assert native.sample_rate == piped.sample_rate
+        assert native.data.shape == piped.data.shape
+        assert np.allclose(native.data, piped.data, atol=1e-4)
+
+    def test_a_stall_is_not_retried_on_the_reader_that_cannot_be_stopped(
+        self, wav_file, monkeypatch
+    ):
+        """A deadline is a fact about the file, not a reason to hang.
+
+        Falling back to the in-process reader after the bounded one gave up
+        would take a decode that correctly refused to wait forever and make
+        it wait forever.
+        """
+        monkeypatch.setattr(audio_io, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+        monkeypatch.delenv("SIPRA_DECODER", raising=False)
+
+        def stalled(*_args, **_kwargs):
+            raise SipraError(
+                ErrorCode.INTERNAL, "stand-in stopped producing output"
+            )
+
+        monkeypatch.setattr(audio_io, "_load_with_ffmpeg", stalled)
+        called: list[str] = []
+        monkeypatch.setattr(
+            audio_io,
+            "_load_with_soundfile",
+            lambda *a, **k: called.append("fallback") or (_ for _ in ()).throw(AssertionError),
+        )
+        with pytest.raises(SipraError):
+            load_audio(wav_file(stereo(sine(440, 0.2))))
+        assert called == [], "a stalled decode must not be retried in-process"

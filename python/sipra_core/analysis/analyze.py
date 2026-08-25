@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from ..audio_io import AudioBuffer, load_audio
+from ..errors import CancelledError
 from . import key as key_mod
 from . import loudness as loudness_mod
 from . import tempo as tempo_mod
@@ -81,8 +82,20 @@ def analyse_buffer(
     include_beats: bool = False,
     key_profile: str = key_mod.DEFAULT_PROFILE,
     on_progress: ProgressFn | None = None,
+    token: object | None = None,
 ) -> TrackAnalysis:
-    """Measure tempo, key and loudness for an already-decoded buffer."""
+    """Measure tempo, key and loudness for an already-decoded buffer.
+
+    ``token`` is checked between measurements. Analysis is the last stage
+    of a separation and the slowest on a cold machine — parts of librosa
+    compile on first use — so it is exactly where a user is most likely to
+    give up, and until now the only stage that ignored them entirely.
+    Cancelling during it did nothing at all.
+    """
+    def check_cancelled() -> None:
+        if token is not None and getattr(token, "cancelled", False):
+            raise CancelledError("Analysis cancelled")
+
     result = TrackAnalysis(
         duration_seconds=buf.duration,
         sample_rate=buf.sample_rate,
@@ -96,12 +109,14 @@ def analyse_buffer(
             except Exception:  # pragma: no cover - progress must never fail a job
                 pass
 
+    check_cancelled()
     report("loudness", 0.05)
     try:
         result.loudness = loudness_mod.measure(buf.data, buf.sample_rate)
     except Exception as exc:
         result.warnings.append(f"Loudness analysis failed: {exc}")
 
+    check_cancelled()
     report("downmix", 0.35)
     mono: np.ndarray | None = None
     try:
@@ -121,6 +136,7 @@ def analyse_buffer(
         mono = None
         analysis_rate = buf.sample_rate
 
+    check_cancelled()
     report("tempo", 0.45)
     if mono is not None:
         try:
@@ -128,6 +144,7 @@ def analyse_buffer(
         except Exception as exc:
             result.warnings.append(f"Tempo analysis failed: {exc}")
 
+    check_cancelled()
     report("key", 0.75)
     if mono is not None:
         try:

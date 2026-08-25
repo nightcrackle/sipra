@@ -12,6 +12,59 @@ real hardware.
 
 ---
 
+## [0.9.14] — 2026-08-25
+
+`unchangedForMs: 464769` — eight minutes on one line, and the line that
+finally located this. 32% on the bar is the decoder between seventy and a
+hundred per cent of the way through the file, and only one of the two
+decode paths can sit there silently for eight minutes: the one that runs
+inside this process.
+
+Had it been ffmpeg, the stall detector added in 0.9.10 would have ended it
+after two minutes with a message. It was libsndfile, which reads in
+process — and a native read cannot be timed out, cancelled or killed. It
+holds the only worker there is until the application is closed.
+
+That also explains the workaround that has worked every time: the second
+attempt runs after a restart, on a fresh process, against a file that is
+no longer freshly written.
+
+### Changed
+
+- **Decoding happens in a child process where ffmpeg is available.** Not
+  because ffmpeg reads audio better — libsndfile reads WAV, FLAC and Ogg
+  perfectly well — but because a child process can be given a deadline,
+  watched for having gone quiet, and killed, and an in-process native read
+  can be none of those things. Every decode is now bounded, cancellable,
+  and reports real progress. libsndfile remains the fallback where ffmpeg
+  is missing; `SIPRA_DECODER=libsndfile` forces it back.
+
+  This does not explain *why* that read stalls. It does mean that if it
+  stalls again you get an error naming how far it got, after two minutes,
+  instead of an application that has to be restarted.
+- **Analysis can be cancelled.** It was the one stage that ignored the
+  request entirely — and it is the slowest on a cold machine and the last
+  in the job, which makes it exactly where somebody gives up. A cancel
+  during it now ends the job rather than being recorded as a failed
+  measurement and stepped past.
+
+### Tests
+
+- 644 TypeScript tests, 581 Python tests.
+- Both decoders are pinned against each other: same file, same samples, so
+  changing which one runs cannot change what anybody hears.
+- A stalled decode must not fall back to the reader that cannot be
+  stopped — otherwise a decode that correctly refused to wait forever
+  would go on to wait forever.
+- Cancellation is covered for both readers separately.
+- The pipeline test no longer carries the analysis cost; analysis has its
+  own test, last, on the largest budget in the file. Parts of librosa
+  compile on first use, which on a cold Windows runner is minutes, and
+  carrying it inside the one test that covers the whole pipeline is what
+  made that test overrun and take five others down with it.
+
+---
+
 ## [0.9.13] — 2026-08-25
 
 You were right that the test failures and the application failure are

@@ -25,7 +25,7 @@ from .analysis import analyse_buffer
 from .audio_io import AudioBuffer, load_audio, write_audio
 from .engines.base import CancellationToken, SeparationRequest
 from .engines.registry import EngineRegistry
-from .errors import ErrorCode, SipraError
+from .errors import CancelledError, ErrorCode, SipraError
 from .stems import sort_stems
 from .trace import trace, trace_memory
 from .waveform import DEFAULT_SAMPLES_PER_BUCKET, compute_peaks, write_peaks
@@ -376,10 +376,17 @@ def separate_track(
             analysis = analyse_buffer(
                 AudioBuffer(data=source.data, sample_rate=out_rate),
                 on_progress=lambda _s, f: progress.report("analyse", f),
+                # The slowest stage on a cold machine, and the one a user is
+                # most likely to give up on. It used to ignore them.
+                token=token,
             )
             analysis_payload = analysis.to_dict()
             warnings.extend(analysis.warnings)
             _log_stage("analysis finished")
+        except CancelledError:
+            # A cancel is not an analysis failure to be noted and moved
+            # past; it is the user asking for the job to end.
+            raise
         except Exception as exc:
             warnings.append(f"Analysis failed: {exc}")
             _log_stage("analysis failed", error=str(exc)[:200])

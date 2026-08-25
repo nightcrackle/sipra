@@ -200,7 +200,12 @@ describeIf('sidecar integration', () => {
           outputDir: path.join(workspace, 'track'),
           engine: 'fixture',
           model: 'fixture-4',
-          analyse: true,
+          // Analysis is measured separately, below. Parts of librosa
+          // compile on first use — minutes on a cold Windows runner — and
+          // carrying that here made the one test that covers the whole
+          // pipeline the slowest in the suite, then took five more down
+          // with it when it overran.
+          analyse: false,
           jobId: 'e2e-job',
         },
         LONG,
@@ -208,7 +213,7 @@ describeIf('sidecar integration', () => {
 
       expect(outcome.stems.map((stem) => stem.id)).toEqual(['vocals', 'drums', 'bass', 'other']);
       expect(outcome.durationSeconds).toBeCloseTo(2.0, 1);
-      expect(outcome.analysis?.integratedLufs).toBeTypeOf('number');
+      expect(outcome.analysis).toBeNull();
 
       for (const stem of outcome.stems) {
         await expect(fs.access(stem.audioPath)).resolves.toBeUndefined();
@@ -292,6 +297,30 @@ describeIf('sidecar integration', () => {
     // to wait for and nothing to restart.
     expect(await sidecar.cancel('no-such-job')).toBe(true);
   });
+
+  it('carries an analysis result across the protocol', async () => {
+    // Last, and on the largest budget in the file, because it is the only
+    // test that pays for compiling part of librosa. What is under test is
+    // that the numbers cross the boundary intact — the measurements
+    // themselves are covered thoroughly on the Python side.
+    const outcome = await sidecar.request<{
+      analysis: { bpm: number | null; integratedLufs: number | null; key: string | null } | null;
+    }>(
+      'separate',
+      {
+        path: sourcePath,
+        outputDir: path.join(workspace, 'analysed'),
+        engine: 'fixture',
+        model: 'fixture-4',
+        analyse: true,
+        jobId: 'analysis-job',
+      },
+      WARMUP,
+    );
+
+    expect(outcome.analysis).not.toBeNull();
+    expect(outcome.analysis?.integratedLufs).toBeTypeOf('number');
+  }, WARMUP);
 
   it('stays responsive to a ping while a job is running', async () => {
     // The worker is separate from the reader thread precisely so a long
