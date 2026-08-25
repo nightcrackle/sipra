@@ -10,7 +10,6 @@ No account. No upload. No subscription.
 
 [![TypeScript](https://github.com/nightcrackle/sipra/actions/workflows/ci.yml/badge.svg)](https://github.com/nightcrackle/sipra/actions/workflows/ci.yml)
 [![Python](https://github.com/nightcrackle/sipra/actions/workflows/python.yml/badge.svg)](https://github.com/nightcrackle/sipra/actions/workflows/python.yml)
-[![Release](https://github.com/nightcrackle/sipra/actions/workflows/release.yml/badge.svg)](https://github.com/nightcrackle/sipra/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
 </div>
