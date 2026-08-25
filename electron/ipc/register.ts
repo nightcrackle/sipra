@@ -618,7 +618,12 @@ export function registerIpc(context: IpcContext): void {
       };
       sidecar.on('progress', forward);
       try {
-        const media = await sidecar.request<{ path: string; title: string; sourceUrl: string }>(
+        const media = await sidecar.request<{
+          path: string;
+          title: string;
+          sourceUrl: string;
+          stagingDir: string | null;
+        }>(
           'youtube.download',
           {
             url: link,
@@ -646,8 +651,14 @@ export function registerIpc(context: IpcContext): void {
           progressTo: 1,
         });
         // The download is only a staging copy; the workspace holds the
-        // canonical source from here on.
-        await fs.rm(media.path, { force: true }).catch(() => undefined);
+        // canonical source from here on. The engine names the directory it
+        // created rather than leaving this to work it out, so there is no
+        // path here that could be anything but a folder we made.
+        if (media.stagingDir) {
+          await fs.rm(media.stagingDir, { recursive: true, force: true }).catch(() => undefined);
+        } else {
+          await fs.rm(media.path, { force: true }).catch(() => undefined);
+        }
         jobs.succeed(job.id);
         notify({
           level: 'info',

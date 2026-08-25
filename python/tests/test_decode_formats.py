@@ -51,8 +51,8 @@ def media(tmp_path_factory):
     directory = tmp_path_factory.mktemp("media")
     built: dict[str, object] = {}
     for codec, container in FORMATS:
-        # A bracketed title, because that is what broke the last release.
-        target = directory / f"TEETH - Laklak [HQ AUDIO] {codec}.{container}"
+        # A bracketed name, because that shape broke an earlier release.
+        target = directory / f"Sample Track [HQ AUDIO] {codec}.{container}"
         result = subprocess.run(
             [
                 FFMPEG, "-v", "error", "-y",

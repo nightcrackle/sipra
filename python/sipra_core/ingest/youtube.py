@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,8 @@ from urllib.parse import urlparse
 from ..audio_io import SUPPORTED_INPUT_EXTENSIONS
 from ..engines.base import CancellationToken
 from ..errors import CancelledError, ErrorCode, SipraError
-from .local import safe_filename, unique_stem
+from ..trace import trace
+from .local import safe_filename
 
 ProgressFn = Callable[[str, float], None]
 
@@ -98,11 +100,16 @@ MAX_DURATION_SECONDS = 60 * 20
 
 _PROGRESS_PATTERN = re.compile(r"\[download\]\s+([0-9.]+)%")
 
-# Placeholder extension for the download target.
+# The fixed name every download is written under.
 #
-# The real one is decided by whatever stream yt-dlp takes, so the name is
-# reserved by stem and the produced file located afterwards.
+# Deliberately free of anything any layer treats as syntax: no glob
+# metacharacters, no `%` for yt-dlp's output template, nothing Windows
+# forbids, and short enough that the path length cannot become a problem.
+DOWNLOAD_STEM = "audio"
 DOWNLOAD_PLACEHOLDER_SUFFIX = ".audio"
+
+#: Prefix for the per-download staging directory.
+STAGING_PREFIX = "dl-"
 
 # A YouTube video id is exactly 11 characters from a fixed alphabet.
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -115,6 +122,10 @@ class RemoteMedia:
     duration_seconds: float | None
     source_url: str
     uploader: str | None = None
+    #: The staging directory holding ``path``, for the caller to remove
+    #: once the audio has been copied into the library. Named explicitly so
+    #: nothing has to guess which directory it is safe to delete.
+    staging_dir: Path | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +134,7 @@ class RemoteMedia:
             "durationSeconds": self.duration_seconds,
             "sourceUrl": self.source_url,
             "uploader": self.uploader,
+            "stagingDir": str(self.staging_dir) if self.staging_dir else None,
         }
 
 
@@ -516,6 +528,7 @@ def download_audio(
 
     dest = Path(destination_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_staging(dest)
 
     report("metadata", 0.06)
     meta = fetch_metadata(url)
@@ -528,8 +541,27 @@ def download_audio(
             {"durationSeconds": duration},
         )
 
-    title = safe_filename(meta.get("title") or "youtube-audio", "youtube-audio")
-    target = unique_stem(dest, title, DOWNLOAD_PLACEHOLDER_SUFFIX)
+    # The downloaded file is named by us, not by the track.
+    #
+    # Putting the video's title in this path was the source of a whole
+    # family of faults, because a title is arbitrary text and this path is
+    # handed to three different systems that each read some of it as
+    # syntax:
+    #
+    # * `glob`, which reads `[`, `]`, `*` and `?` as pattern syntax — a
+    #   bracketed title made a finished download impossible to find;
+    # * yt-dlp's output template, where `%` begins a field reference;
+    # * Windows, which forbids several characters outright and gives up on
+    #   paths beyond 260 characters — reachable with a long title inside a
+    #   long profile path.
+    #
+    # None of that is worth defending against one escape at a time. The
+    # download goes into a directory of its own under a fixed short name,
+    # and the title — which is only ever needed for the library entry —
+    # comes from the metadata, where it never has to survive a filesystem.
+    staging = dest / f"{STAGING_PREFIX}{secrets.token_hex(8)}"
+    staging.mkdir(parents=True, exist_ok=True)
+    target = staging / f"{DOWNLOAD_STEM}{DOWNLOAD_PLACEHOLDER_SUFFIX}"
 
     cmd = [
         exe,
@@ -668,13 +700,56 @@ def download_audio(
 
     report("download", 1.0)
 
+    # The title comes from the metadata, never from the filename — the
+    # filename is ours now and says nothing about the track. `safe_filename`
+    # still runs on it, because it becomes a directory name in the library.
+    title = safe_filename(meta.get("title") or "youtube-audio", "youtube-audio")
+
     return RemoteMedia(
         path=produced,
-        title=meta.get("title") or produced.stem,
+        title=title,
         duration_seconds=duration if isinstance(duration, (int, float)) else None,
         source_url=meta.get("sourceUrl") or url,
         uploader=meta.get("uploader"),
+        staging_dir=staging,
     )
+
+
+#: How long a staging directory may sit before it is considered abandoned.
+STAGING_TTL_SECONDS = 6 * 60 * 60
+
+
+def _sweep_stale_staging(dest: Path, now: float | None = None) -> int:
+    """Remove staging directories left behind by earlier downloads.
+
+    A download that fails, is cancelled, or dies with the application
+    leaves its staging directory on disk. Cleaning up on the way in rather
+    than on the way out covers the case a `finally` block cannot: the
+    process not being there to run it.
+
+    Only directories matching the generated prefix are touched, and only
+    ones old enough that no download could still be using them. Returns how
+    many were removed.
+    """
+    cutoff = (now if now is not None else time.time()) - STAGING_TTL_SECONDS
+    removed = 0
+    try:
+        entries = list(dest.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(STAGING_PREFIX) or not entry.is_dir():
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError:  # pragma: no cover - raced with something else
+            continue
+    if removed:
+        trace("removed abandoned download folders", count=removed)
+    return removed
 
 
 #: Extensions that are work in progress, not a finished download.
@@ -687,10 +762,12 @@ def _same_stem(directory: Path, stem: str) -> list[Path]:
     Compared literally rather than matched with ``glob``. A YouTube title
     is user text and lands in the filename intact, and ``glob`` reads
     ``[``, ``]``, ``*`` and ``?`` as pattern syntax — so a track called
-    "TEETH - Laklak [HQ AUDIO]" produced a pattern whose bracket expression
-    matched a single character, found nothing, and reported a completed
-    download as having produced no file. Bracketed tags are close to
-    universal in YouTube titles, so this was not an edge case.
+    a title carrying a bracketed tag — and those are close to universal on
+    YouTube — produced a pattern whose bracket expression matched a single
+    character, found nothing, and reported a completed download as having
+    produced no file. The download is named by Sipra now, so no title
+    reaches this; the literal comparison is kept because a lookup should
+    not depend on that.
     """
     try:
         entries = list(directory.iterdir())

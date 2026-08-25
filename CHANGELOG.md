@@ -12,6 +12,76 @@ real hardware.
 
 ---
 
+## [0.9.11] — 2026-08-25
+
+The Windows CI failures and the import failures were the same problem
+seen from two sides, and the connection is what fixes it properly.
+
+Three tests failed on `windows-latest` with `Invalid argument` while
+creating files named `Song ** stars`, `Song ? maybe` and `a[b]c*d?e`.
+Windows forbids `*` and `?` in filenames outright, so those tests could
+only ever have passed on Linux. But the reason such names were being
+tested at all is that the video's title was going into the download's
+path — and that is the actual fault.
+
+A title is arbitrary text, and that path is handed to three systems that
+each read part of it as syntax:
+
+* `glob`, which reads `[`, `]`, `*` and `?` as pattern syntax — this
+  already broke finding the file in 0.9.9;
+* yt-dlp's output template, where `%` begins a field reference, so a title
+  containing `%(` would be read as one;
+* Windows, which forbids several characters and gives up on paths past 260
+  characters — reachable with a long title inside a long profile path.
+
+Escaping correctly for all three, forever, is not worth attempting when
+the title is not needed there at all.
+
+### Changed
+
+- **The download is named by Sipra, not by the track.** Each download goes
+  into a directory of its own under a fixed short name with no character
+  any layer treats as syntax. The title is read from the metadata, where
+  it belongs and where it never has to survive a filesystem. This retires
+  the whole family of faults rather than the one instance that was
+  reported.
+- **The path length no longer depends on the title.** It is a fixed
+  twenty-three characters whatever the track is called, so the Windows
+  ceiling cannot be reached by a long name.
+- **Abandoned download folders are cleaned up on the way in.** A download
+  that fails, is cancelled, or dies with the application cannot run a
+  cleanup step — sweeping on entry covers the case a `finally` block
+  cannot.
+- **`unique_stem` is gone.** It existed only to reserve a title-derived
+  filename, which no longer happens. Dead code with tests attached still
+  costs maintenance.
+
+### Fixed
+
+- **Three tests that could not pass on Windows.** They wrote filenames
+  containing `*` and `?`. Those characters can never reach a real filename
+  — `safe_filename` removes them and the filesystem refuses them — so the
+  property worth testing is that they are stripped, not that a file
+  containing them can be found. That is what is tested now.
+
+### Tests
+
+- 639 TypeScript tests, 573 Python tests, and the Windows job passes.
+- The download path is asserted to contain no glob metacharacter, no `%`,
+  nothing Windows forbids, and no title. The lookup keeps its
+  bracketed-name coverage regardless, because a lookup should not depend
+  on the name being ours.
+- The folder sweep: removes what is abandoned, leaves what may still be
+  running, and never touches anything outside its own prefix.
+
+### Housekeeping
+
+- Every reference to the specific track used while debugging has been
+  removed from the source, the tests and this changelog. Test fixtures use
+  neutral names.
+
+---
+
 ## [0.9.10] — 2026-08-24
 
 Another import stuck on "Reading the file", this time with no log to read.
@@ -93,9 +163,10 @@ A regression from 0.9.8, and entirely self-inflicted. Dropping the forced
 WAV conversion meant the downloaded file's extension is no longer known in
 advance, so it is found afterwards by its stem — and that lookup used
 `glob`, which reads `[`, `]`, `*` and `?` as pattern syntax. A YouTube
-title lands in the filename intact, so "TEETH - Laklak [HQ AUDIO]" became
-a pattern whose bracket expression matches a single character. It matched
-nothing, and a completed download was reported as having produced no file.
+title lands in the filename intact, so a bracketed tag such as
+"[HQ AUDIO]" became a pattern whose bracket expression matches a single
+character. It matched nothing, and a completed download was reported as
+having produced no file.
 
 While every download was forced to WAV the exact path always existed and
 that lookup was never reached, which is why the fault arrived with the fix
@@ -135,7 +206,7 @@ than against `Song.m4a`.
 ## [0.9.8] — 2026-08-24
 
 A YouTube import stopped at 30% on "Reading the file". The log's last line
-was `decoding TEETH - Laklak [HQ AUDIO].wav | at=44100` and nothing after
+was `decoding <the downloaded file>.wav | at=44100` and nothing after
 it — decoding was a single opaque call, so the record stopped exactly
 where it needed to keep going.
 

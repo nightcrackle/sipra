@@ -971,36 +971,6 @@ class TestDownloadFormat:
         assert '"--audio-format", "wav"' not in source
         assert '"--extract-audio"' in source
 
-    def test_reserves_the_whole_stem_because_the_extension_is_unknown(self, tmp_path):
-        from sipra_core.ingest.local import unique_stem
-
-        (tmp_path / "Song.opus").write_bytes(b"x")
-        chosen = unique_stem(tmp_path, "Song", ".audio")
-        # Not "Song.audio": a leftover Song.opus would be found by the glob
-        # that locates the download afterwards.
-        assert chosen.stem != "Song"
-        assert chosen.suffix == ".audio"
-
-    def test_a_free_stem_is_used_as_is(self, tmp_path):
-        from sipra_core.ingest.local import unique_stem
-
-        assert unique_stem(tmp_path, "Song", ".audio").name == "Song.audio"
-
-    def test_successive_reservations_do_not_collide(self, tmp_path):
-        from sipra_core.ingest.local import unique_stem
-
-        first = unique_stem(tmp_path, "Song", ".audio")
-        first.write_bytes(b"x")
-        second = unique_stem(tmp_path, "Song", ".audio")
-        assert second != first
-        second.write_bytes(b"x")
-        assert unique_stem(tmp_path, "Song", ".audio") not in (first, second)
-
-    def test_a_suffix_without_a_dot_is_accepted(self, tmp_path):
-        from sipra_core.ingest.local import unique_stem
-
-        assert unique_stem(tmp_path, "Song", "audio").suffix == ".audio"
-
     def test_the_download_polls_rather_than_blocking_on_output(self):
         """The deadline has to be reachable.
 
@@ -1019,18 +989,20 @@ class TestDownloadFormat:
 
 
 class TestLocatingTheDownload:
-    """Finding the file yt-dlp wrote, when its name is user text.
+    """Finding the file yt-dlp wrote.
 
-    A YouTube title reaches the filename intact, and it was being matched
-    with `glob`, which reads `[`, `]`, `*` and `?` as pattern syntax. A
-    track called "TEETH - Laklak [HQ AUDIO]" produced a pattern whose
-    bracket expression matched one character, found nothing, and reported a
-    finished download as having produced no file. Bracketed tags are close
-    to universal in YouTube titles.
+    The download is written under a fixed name of Sipra's choosing, so the
+    lookup no longer has to survive arbitrary text. It used to: the video's
+    title went into the filename, and the lookup matched with `glob`, which
+    reads `[`, `]`, `*` and `?` as pattern syntax — a bracketed title
+    produced a pattern whose bracket expression matched a single character,
+    found nothing, and reported a finished download as having produced no
+    file.
 
-    This only surfaced once the extension stopped being known in advance:
-    while every download was forced to WAV, the exact path existed and the
-    glob was never reached.
+    The comparison is literal now and the name is ours, so both halves of
+    that fault are gone. These tests hold both properties: the lookup
+    handles names containing pattern syntax, and the download path never
+    contains any.
     """
 
     def _locate(self, path):
@@ -1038,91 +1010,215 @@ class TestLocatingTheDownload:
 
         return _locate_output(path)
 
-    def test_finds_the_file_behind_a_bracketed_title(self, tmp_path):
-        (tmp_path / "TEETH - Laklak [HQ AUDIO].m4a").write_bytes(b"x")
-        found = self._locate(tmp_path / "TEETH - Laklak [HQ AUDIO].audio")
+    def test_the_download_name_contains_nothing_any_layer_reads_as_syntax(self):
+        """The property that retires the whole class of fault.
+
+        `glob` metacharacters, `%` for yt-dlp's output template, and the
+        characters Windows forbids — none of them can appear, because the
+        name is a constant.
+        """
+        from sipra_core.ingest.youtube import (
+            DOWNLOAD_PLACEHOLDER_SUFFIX,
+            DOWNLOAD_STEM,
+            STAGING_PREFIX,
+        )
+
+        for text in (DOWNLOAD_STEM, DOWNLOAD_PLACEHOLDER_SUFFIX, STAGING_PREFIX):
+            assert not (set(text) & set('[]*?%<>:"/\\|')), text
+            assert text == text.strip()
+
+    def test_finds_the_download_under_its_fixed_name(self, tmp_path):
+        (tmp_path / "audio.m4a").write_bytes(b"x")
+        found = self._locate(tmp_path / "audio.audio")
         assert found is not None
-        assert found.name == "TEETH - Laklak [HQ AUDIO].m4a"
+        assert found.name == "audio.m4a"
+
+    def test_finds_a_file_behind_a_bracketed_name(self, tmp_path):
+        """Kept because the lookup must not depend on the name being ours."""
+        (tmp_path / "Some Track [HQ AUDIO].m4a").write_bytes(b"x")
+        found = self._locate(tmp_path / "Some Track [HQ AUDIO].audio")
+        assert found is not None
+        assert found.name == "Some Track [HQ AUDIO].m4a"
 
     @pytest.mark.parametrize(
         "title",
         [
             "Song [Official Video]",
             "Song [4K] [Remastered]",
-            "Song ** stars",
-            "Song ? maybe",
             "Song [] empty",
             "Song [!not a class]",
             "100% Real",
-            "a[b]c*d?e",
+            "a[b]c d e",
         ],
     )
-    def test_every_glob_metacharacter_in_a_title_is_handled(self, tmp_path, title):
+    def test_pattern_syntax_in_a_name_is_handled(self, tmp_path, title):
+        # Only characters every supported filesystem accepts. `*` and `?`
+        # are legal on POSIX and rejected outright by Windows, so a test
+        # that writes them passes on one platform and errors on the other —
+        # which is exactly what happened in CI. They are covered below, by
+        # asserting they can never reach a filename in the first place.
         (tmp_path / f"{title}.opus").write_bytes(b"x")
         found = self._locate(tmp_path / f"{title}.audio")
         assert found is not None, f"could not find the download for {title!r}"
         assert found.name == f"{title}.opus"
 
-    def test_a_bracketed_title_does_not_match_a_different_file(self, tmp_path):
+    @pytest.mark.parametrize("character", ["*", "?", "<", ">", ":", '"', "|", "\\", "/"])
+    def test_characters_windows_forbids_never_reach_a_filename(self, character):
+        """The other half of the pattern-syntax story.
+
+        `*` and `?` are glob syntax and are also illegal in a Windows
+        filename, so the lookup can never meet them — `safe_filename`
+        removes them first. Asserting that is worth more than a test that
+        writes such a file, which cannot run on the platform that matters.
+        """
+        from sipra_core.ingest.local import safe_filename
+
+        cleaned = safe_filename(f"Song {character} Title")
+        assert character not in cleaned
+
+    def test_a_bracketed_name_does_not_match_a_different_file(self, tmp_path):
         # The failure mode in reverse: a pattern that matches too much.
         (tmp_path / "Song H.m4a").write_bytes(b"x")
         assert self._locate(tmp_path / "Song [HQ].audio") is None
 
     def test_prefers_a_known_audio_extension(self, tmp_path):
-        (tmp_path / "Song.m4a").write_bytes(b"x")
-        (tmp_path / "Song.json").write_bytes(b"{}")
-        assert self._locate(tmp_path / "Song.audio").suffix == ".m4a"
+        (tmp_path / "audio.m4a").write_bytes(b"x")
+        (tmp_path / "audio.json").write_bytes(b"{}")
+        assert self._locate(tmp_path / "audio.audio").suffix == ".m4a"
 
     @pytest.mark.parametrize("suffix", [".part", ".ytdl", ".temp", ".tmp", ".download"])
     def test_ignores_work_in_progress(self, tmp_path, suffix):
-        (tmp_path / f"Song{suffix}").write_bytes(b"x")
-        assert self._locate(tmp_path / "Song.audio") is None
+        (tmp_path / f"audio{suffix}").write_bytes(b"x")
+        assert self._locate(tmp_path / "audio.audio") is None
 
     def test_takes_the_exact_path_when_it_exists(self, tmp_path):
-        exact = tmp_path / "Song.audio"
+        exact = tmp_path / "audio.audio"
         exact.write_bytes(b"x")
         assert self._locate(exact) == exact
 
     def test_a_directory_is_not_mistaken_for_the_download(self, tmp_path):
-        (tmp_path / "Song.m4a").mkdir()
-        assert self._locate(tmp_path / "Song.audio") is None
+        (tmp_path / "audio.m4a").mkdir()
+        assert self._locate(tmp_path / "audio.audio") is None
 
     def test_a_longer_stem_is_not_a_match(self, tmp_path):
-        (tmp_path / "Song Two.m4a").write_bytes(b"x")
-        assert self._locate(tmp_path / "Song.audio") is None
+        (tmp_path / "audio two.m4a").write_bytes(b"x")
+        assert self._locate(tmp_path / "audio.audio") is None
 
     def test_missing_directory_returns_nothing_rather_than_raising(self, tmp_path):
-        assert self._locate(tmp_path / "gone" / "Song.audio") is None
+        assert self._locate(tmp_path / "gone" / "audio.audio") is None
 
 
-class TestReservingAStem:
-    """`unique_stem` had the identical fault, with a quieter symptom.
+class TestStagingDirectories:
+    """Each download gets a directory of its own, and they are cleaned up.
 
-    Matching with `glob` meant a bracketed stem reported every name as
-    free, so it reserved nothing and two downloads of similarly titled
-    tracks could land on each other.
+    A download that fails, is cancelled, or dies with the application
+    cannot run a cleanup step, so the sweep happens on the way in instead.
     """
 
-    def _reserve(self, directory, stem):
-        from sipra_core.ingest.local import unique_stem
+    def _sweep(self, dest, now=None):
+        from sipra_core.ingest.youtube import _sweep_stale_staging
 
-        return unique_stem(directory, stem, ".audio")
+        return _sweep_stale_staging(dest, now=now)
 
-    def test_detects_a_taken_bracketed_stem(self, tmp_path):
-        (tmp_path / "Song [HQ AUDIO].m4a").write_bytes(b"x")
-        chosen = self._reserve(tmp_path, "Song [HQ AUDIO]")
-        assert chosen.stem != "Song [HQ AUDIO]"
+    def _make(self, dest, name, age_seconds=0.0):
+        import os
+        import time
 
-    def test_leaves_a_free_bracketed_stem_alone(self, tmp_path):
-        chosen = self._reserve(tmp_path, "Song [HQ AUDIO]")
-        assert chosen.name == "Song [HQ AUDIO].audio"
+        directory = dest / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "audio.m4a").write_bytes(b"x")
+        when = time.time() - age_seconds
+        os.utime(directory, (when, when))
+        return directory
 
-    def test_a_missing_directory_is_treated_as_empty(self, tmp_path):
-        chosen = self._reserve(tmp_path / "not-there", "Song")
-        assert chosen.name == "Song.audio"
+    def test_removes_an_abandoned_directory(self, tmp_path):
+        from sipra_core.ingest.youtube import STAGING_TTL_SECONDS
 
-    def test_reservations_remain_distinct_across_metacharacters(self, tmp_path):
-        first = self._reserve(tmp_path, "Song [x]")
-        first.write_bytes(b"x")
-        second = self._reserve(tmp_path, "Song [x]")
-        assert second != first
+        stale = self._make(tmp_path, "dl-deadbeef", STAGING_TTL_SECONDS + 60)
+        assert self._sweep(tmp_path) == 1
+        assert not stale.exists()
+
+    def test_leaves_a_download_that_may_still_be_running(self, tmp_path):
+        fresh = self._make(tmp_path, "dl-cafebabe", 5)
+        assert self._sweep(tmp_path) == 0
+        assert fresh.exists()
+
+    def test_never_touches_anything_outside_the_prefix(self, tmp_path):
+        from sipra_core.ingest.youtube import STAGING_TTL_SECONDS
+
+        keep = self._make(tmp_path, "important", STAGING_TTL_SECONDS + 60)
+        loose = tmp_path / "song.m4a"
+        loose.write_bytes(b"x")
+        assert self._sweep(tmp_path) == 0
+        assert keep.exists()
+        assert loose.exists()
+
+    def test_a_missing_directory_is_not_an_error(self, tmp_path):
+        assert self._sweep(tmp_path / "gone") == 0
+
+
+class TestTheDownloadPathIsOurs:
+    """The download path contains nothing derived from the video.
+
+    Putting a title into that path handed arbitrary text to three systems
+    that each read part of it as syntax: `glob` (`[ ] * ?`), yt-dlp's
+    output template (`%`), and Windows (forbidden characters, and a 260
+    character ceiling that a long title inside a long profile path can
+    reach). Escaping for all three, correctly, forever, is not a thing
+    worth attempting when the title is not needed there at all.
+    """
+
+    def test_the_output_template_carries_no_title(self):
+        import inspect
+
+        source = inspect.getsource(youtube.download_audio)
+        # The title is read from metadata for the library entry, and the
+        # download path is built from constants.
+        assert "DOWNLOAD_STEM" in source
+        assert "STAGING_PREFIX" in source
+        assert "unique_stem" not in source
+
+    def test_the_staging_name_is_unique_per_download(self):
+        import inspect
+        import re
+
+        source = inspect.getsource(youtube.download_audio)
+        assert re.search(r"secrets\.token_hex", source), "staging names must not collide"
+
+    def test_a_percent_in_a_title_cannot_reach_the_output_template(self):
+        """`%` begins a field reference in yt-dlp's output template.
+
+        A title like "50%(off) Live" would have been read as one. It never
+        reaches the template now.
+        """
+        from sipra_core.ingest.youtube import DOWNLOAD_PLACEHOLDER_SUFFIX, DOWNLOAD_STEM
+
+        assert "%" not in DOWNLOAD_STEM
+        assert "%" not in DOWNLOAD_PLACEHOLDER_SUFFIX
+
+    def test_the_download_path_length_does_not_depend_on_the_title(self, tmp_path):
+        """Windows gives up beyond 260 characters.
+
+        A hundred-character title inside a long profile path was a real way
+        to get there. The staging path is a fixed twenty-three characters
+        whatever the track is called.
+        """
+        from sipra_core.ingest.youtube import (
+            DOWNLOAD_PLACEHOLDER_SUFFIX,
+            DOWNLOAD_STEM,
+            STAGING_PREFIX,
+        )
+
+        # "dl-" + 16 hex + separator + "audio.audio"
+        longest = len(STAGING_PREFIX) + 16 + 1 + len(DOWNLOAD_STEM) + len(
+            DOWNLOAD_PLACEHOLDER_SUFFIX
+        )
+        assert longest < 48
+
+    def test_the_title_still_reaches_the_library_entry(self):
+        """Naming the file neutrally must not lose the track's name."""
+        import inspect
+
+        source = inspect.getsource(youtube.download_audio)
+        assert "safe_filename(meta.get(\"title\")" in source
+        assert "title=title" in source
