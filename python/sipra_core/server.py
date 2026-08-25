@@ -43,7 +43,6 @@ from .protocol import (
 )
 from .stems import STEM_IDS
 from .stems import describe as describe_stems
-from .trace import trace
 from .waveform import DEFAULT_SAMPLES_PER_BUCKET, compute_peaks, write_peaks
 
 Handler = Callable[["SipraServer", Request], Any]
@@ -429,38 +428,7 @@ def _h_prepare_model(server: SipraServer, request: Request) -> dict:
             on_progress=report,
         )
 
-    if warmup:
-        outcome["analysisWarmed"] = _warm_analysis(report)
     return outcome
-
-
-def _warm_analysis(report: Callable[[str, float], None] | None = None) -> bool:
-    """Pay the analysis stage's cold start during setup.
-
-    Tempo and key detection go through librosa, which compiles parts of
-    itself on first use. That is tens of seconds on a cold machine and it
-    used to land inside the user's first separation, at the very end of the
-    bar — the same shape of unexplained pause as the model download, in the
-    one place a progress bar is least forgivable.
-
-    A second of silence is enough to trigger the compilation. Failure here
-    is not worth reporting: the analysis will simply be slow once instead.
-    """
-    try:
-        import numpy as np
-
-        from .analysis import analyse_buffer
-        from .audio_io import AudioBuffer
-
-        if report:
-            report("model", 0.9)
-        trace("warming the analysis")
-        analyse_buffer(AudioBuffer(data=np.zeros((1, 22050), dtype=np.float32), sample_rate=22050))
-        trace("analysis warm")
-        return True
-    except Exception as exc:  # pragma: no cover - never fails setup
-        trace("analysis warm-up skipped", reason=str(exc)[:120])
-        return False
 
 
 HANDLERS: dict[str, Handler] = {

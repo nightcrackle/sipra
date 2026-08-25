@@ -12,6 +12,64 @@ real hardware.
 
 ---
 
+## [0.9.13] — 2026-08-25
+
+You were right that the test failures and the application failure are
+connected. They share a mechanism, and it is a serious one.
+
+### Fixed
+
+- **A killed process could mark its replacement dead.** Killing a process
+  does not make it go quiet. Its exit event, and any output still in
+  flight, arrive whenever the operating system gets to them — on a slow
+  machine, *after* a replacement has already been spawned. Every handler
+  attached to the old process wrote to state shared with whatever was
+  current, so the corpse announced the live engine as gone and rejected
+  work it was perfectly able to do. Leftover bytes from the old process
+  could likewise be fed into the new one's message stream.
+
+  This is why every job after a restart reported "the audio engine did not
+  answer in time" while the engine was listening the whole while. It is
+  also the second notification you saw: cancelling a stuck job restarts
+  the engine, and the restart left the client convinced there was nothing
+  there. Handlers now check they still speak for the running process.
+
+  Reproduced deterministically by spawning the replacement before the old
+  process has finished dying, and verified by removing the guard and
+  watching those tests fail.
+
+### Removed
+
+- **The analysis warm-up added in 0.9.12.** It warmed with a second of
+  silence, and analysis short-circuits on silence — measured here, a real
+  signal still paid the full cost afterwards, so it bought about four
+  seconds while adding an unbounded step to setup and to the test suite's
+  fixture. On the Windows runner that fixture then exceeded ten minutes
+  and took fourteen tests down with it. It did not do what it claimed and
+  it is gone.
+
+### Tests
+
+- 643 TypeScript tests, 573 Python tests.
+- Three new tests for a restart whose old process reports late: an async
+  request afterwards, three restarts in a row, and a real separation.
+  Without the guard, two fail immediately with the engine reported
+  unavailable.
+
+### What this does not fix
+
+The import stopping at 32% on "Reading the file" is still unexplained.
+32% is the decoder about ninety-five per cent of the way through the file,
+which is a strange place to stop and not one this release accounts for.
+
+What has changed is the consequence: cancelling such a job now genuinely
+recovers the engine, instead of leaving an application that appears to
+work and answers nothing. If it stalls again, the log is what will settle
+it — and it should now name the decoder and how far it got, or have turned
+the stall into an error saying so.
+
+---
+
 ## [0.9.12] — 2026-08-25
 
 Ten test failures on Windows CI. One was a real fault, one was a real bug

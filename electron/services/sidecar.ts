@@ -90,6 +90,14 @@ export interface SidecarOptions {
   onTrace?: (trace: SidecarTrace) => void;
   /** Override the cancel grace period. Tests use a short one. */
   cancelGraceMs?: number;
+  /**
+   * How long a restart waits for the old process to report its exit.
+   *
+   * Zero makes the late-exit ordering deterministic, which is the only way
+   * to test it: the replacement is spawned before the old process has
+   * finished dying, exactly as happens on a slow machine.
+   */
+  restartExitGraceMs?: number;
 }
 
 export class Sidecar extends EventEmitter {
@@ -193,11 +201,33 @@ export class Sidecar extends EventEmitter {
       };
       this.once('ready', onReady);
 
+      /**
+       * Whether this handler still speaks for the running engine.
+       *
+       * A killed process does not go quiet immediately. Its exit event and
+       * any buffered output arrive whenever the operating system gets to
+       * them, which on Windows is slow enough to land *after* a
+       * replacement has been spawned — and every one of these handlers
+       * closes over `child` while writing to state shared with whatever is
+       * current. The old process's exit was therefore able to mark the new
+       * one dead, and its leftover bytes to be fed into the new one's
+       * message stream.
+       *
+       * That is the fault behind "the audio engine did not answer in
+       * time" after a restart: the engine was alive and listening, and the
+       * client had been told it was gone.
+       */
+      const isCurrent = (): boolean => this.child === child;
+
       child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => this.consume(chunk));
+      child.stdout.on('data', (chunk: string) => {
+        if (!isCurrent()) return;
+        this.consume(chunk);
+      });
 
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
+        if (!isCurrent()) return;
         this.stderrTail.push(chunk);
         // Bounded so a chatty dependency cannot grow this without limit.
         if (this.stderrTail.length > 200) this.stderrTail.shift();
@@ -207,6 +237,7 @@ export class Sidecar extends EventEmitter {
       child.on('error', (error) => {
         clearTimeout(timer);
         this.off('ready', onReady);
+        if (!isCurrent()) return;
         this.failAll(
           new SidecarError({
             code: 'SIDECAR_SPAWN_FAILED',
@@ -219,6 +250,11 @@ export class Sidecar extends EventEmitter {
       child.on('exit', (code, signal) => {
         clearTimeout(timer);
         this.off('ready', onReady);
+        if (!isCurrent()) {
+          // A process we already replaced. Its death is expected and says
+          // nothing about the engine now running.
+          return;
+        }
         this.ready = false;
         this.child = null;
         const wasExpected = this.stopping;
@@ -481,7 +517,7 @@ export class Sidecar extends EventEmitter {
     }
 
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 3000);
+      const timer = setTimeout(resolve, this.options.restartExitGraceMs ?? 3000);
       child.once('exit', () => {
         clearTimeout(timer);
         resolve();

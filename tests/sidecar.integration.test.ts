@@ -106,13 +106,6 @@ describeIf('sidecar integration', () => {
       env: { SIPRA_ENABLE_FIXTURE_ENGINE: '1' },
     });
     await sidecar.start();
-
-    // Pay the analysis stage's compile cost here rather than inside a
-    // test that is measuring something else. This is the same warm-up
-    // setup performs on a user's machine, and for the same reason.
-    await sidecar
-      .request('models.prepare', { engine: 'fixture', warmup: true }, WARMUP)
-      .catch(() => undefined);
   }, WARMUP);
 
   afterAll(async () => {
@@ -431,6 +424,87 @@ describeIf('cancelling a job that will not stop', () => {
     await wedged.request('debug.wedge', { jobId: 'brief', seconds: 0.2 }, SHORT);
     expect(await wedged.cancel('brief')).toBe(true);
     expect(restarts).toHaveLength(0);
+  }, LONG);
+});
+
+/**
+ * A restart, with the old process dying slowly.
+ *
+ * Killing a process does not make it go quiet at once: its exit event and
+ * any buffered output arrive whenever the operating system gets to them.
+ * On a slow machine that lands *after* a replacement has been spawned, and
+ * every handler attached to the old process writes to state shared with
+ * whatever is current — so the corpse could mark the live engine dead.
+ *
+ * The result was "the audio engine did not answer in time" for every job
+ * after a restart, on a healthy engine that was listening the whole while.
+ * Setting the grace to zero guarantees that ordering here instead of
+ * waiting for a slow machine to produce it.
+ */
+describeIf('a restart whose old process reports late', () => {
+  let workspace: string;
+  let sidecar: Sidecar;
+
+  beforeAll(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'sipra-late-'));
+    sidecar = new Sidecar({
+      pythonPath: python as string,
+      cwd: pythonDir,
+      env: { SIPRA_ENABLE_FIXTURE_ENGINE: '1' },
+      cancelGraceMs: 1500,
+      // Do not wait for the old process at all: the replacement is spawned
+      // while it is still dying, which is the case being tested.
+      restartExitGraceMs: 0,
+    });
+    await sidecar.start();
+  }, WARMUP);
+
+  afterAll(async () => {
+    await sidecar?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  it('still answers async requests afterwards', async () => {
+    await sidecar.restart('deliberate, for the test');
+    const result = await sidecar.request<{ wedged: boolean }>(
+      'debug.wedge',
+      { seconds: 0.1 },
+      SHORT,
+    );
+    expect(result.wedged).toBe(true);
+  }, LONG);
+
+  it('survives being restarted repeatedly', async () => {
+    // Each restart leaves another process dying in the background, so this
+    // is where a stale handler would accumulate its damage.
+    for (let round = 0; round < 3; round += 1) {
+      await sidecar.restart(`round ${round}`);
+      const pong = await sidecar.request<{ pong: boolean }>('ping', {}, SHORT);
+      expect(pong.pong).toBe(true);
+    }
+    const result = await sidecar.request<{ wedged: boolean }>(
+      'debug.wedge',
+      { seconds: 0.1 },
+      SHORT,
+    );
+    expect(result.wedged).toBe(true);
+  }, LONG);
+
+  it('runs a real separation after a restart', async () => {
+    await sidecar.restart('deliberate, for the test');
+    const outcome = await sidecar.request<{ stems: unknown[] }>(
+      'separate',
+      {
+        path: sharedSource(workspace, python as string),
+        outputDir: path.join(workspace, 'after-late-exit'),
+        engine: 'fixture',
+        model: 'fixture-4',
+        analyse: false,
+        jobId: 'after-late-exit',
+      },
+      LONG,
+    );
+    expect(outcome.stems).toHaveLength(4);
   }, LONG);
 });
 
