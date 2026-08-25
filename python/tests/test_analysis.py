@@ -307,3 +307,83 @@ class TestAnalyseBuffer:
             "rmsDb", "crestFactorDb",
         ):
             assert field in payload, f"missing {field}"
+
+
+class TestBoundedAnalysis:
+    """Analysis in a child process.
+
+    Tempo, key and loudness are numpy, scipy and librosa calls, and a
+    native call that stalls inside the sidecar cannot be timed out,
+    cancelled or killed — it holds the only worker there is until the
+    application is closed. A real job stopped inside the loudness
+    measurement and stayed at 96%: a stage that reported once and never
+    again, with nothing able to end it.
+
+    Run as a child, the same work is bounded and killable. These check the
+    child produces the same answer, honours a deadline, and stops when
+    asked.
+    """
+
+    def _bounded(self, *args, **kwargs):
+        from sipra_core.analysis import analyse_file_bounded
+
+        return analyse_file_bounded(*args, **kwargs)
+
+    def test_matches_the_in_process_measurement(self, wav_file):
+        """Moving the work must not move the numbers."""
+        from sipra_core.analysis import analyse_file
+
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 3.0)), name="bounded.wav")
+        native = analyse_file(path).to_dict()
+        child = self._bounded(path)
+
+        assert child["sampleRate"] == native["sampleRate"]
+        assert child["channels"] == native["channels"]
+        assert child["durationSeconds"] == pytest.approx(native["durationSeconds"], abs=0.01)
+        assert child["integratedLufs"] == pytest.approx(native["integratedLufs"], abs=0.1)
+        assert child["key"] == native["key"]
+
+    def test_reports_progress_relayed_from_the_child(self, wav_file):
+        """A stage that reports once and never again is what this replaces."""
+        seen: list[tuple[str, float]] = []
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="progress.wav")
+        self._bounded(path, on_progress=lambda s, f: seen.append((s, f)))
+
+        assert seen, "analysis that reports nothing looks like analysis that stopped"
+        stages = [stage for stage, _ in seen]
+        assert "loudness" in stages
+        assert seen[-1][1] == pytest.approx(1.0)
+        assert [f for _, f in seen] == sorted(f for _, f in seen)
+
+    def test_a_deadline_is_enforced(self, wav_file):
+        from sipra_core.errors import SipraError
+
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="deadline.wav")
+        with pytest.raises(SipraError):
+            # Not enough time for an interpreter to start, let alone measure.
+            self._bounded(path, timeout=0.05)
+
+    def test_cancellation_stops_it(self, wav_file):
+        from sipra_core.errors import CancelledError
+
+        class _Cancelled:
+            cancelled = True
+
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="cancel.wav")
+        with pytest.raises(CancelledError):
+            self._bounded(path, token=_Cancelled())
+
+    def test_the_child_does_not_depend_on_the_working_directory(self, wav_file, monkeypatch):
+        """It imports the package by name, from wherever it is started.
+
+        Under a test runner the parent's import path comes from the runner,
+        not from the current directory, so a child that relied on the
+        directory failed instantly — and would have done the same for any
+        caller whose working directory was not the package's own.
+        """
+        import tempfile
+
+        path = wav_file(stereo(dbfs_sine(-14.0, 220.0, 2.0)), name="cwd.wav")
+        with tempfile.TemporaryDirectory() as elsewhere:
+            monkeypatch.chdir(elsewhere)
+            assert self._bounded(path)["sampleRate"] == 44100

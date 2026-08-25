@@ -9,6 +9,10 @@ failure rather than sinking the whole analysis.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +21,8 @@ from typing import Any
 import numpy as np
 
 from ..audio_io import AudioBuffer, load_audio
-from ..errors import CancelledError
+from ..errors import CancelledError, ErrorCode, SipraError
+from ..trace import trace
 from . import key as key_mod
 from . import loudness as loudness_mod
 from . import tempo as tempo_mod
@@ -170,3 +175,112 @@ def analyse_file(
         key_profile=key_profile,
         on_progress=on_progress,
     )
+
+
+#: Ceiling on one analysis run. Generous, because parts of librosa compile
+#: on first use, which on a cold machine is tens of seconds before any
+#: measurement starts.
+ANALYSIS_TIMEOUT_SECONDS = 600
+
+#: How long analysis may produce nothing before it is given up on.
+ANALYSIS_STALL_SECONDS = 180
+
+_PROGRESS_LINE = re.compile(r"^\s*(\w+)\s+([0-9.]+)%\s*$")
+
+
+def analyse_file_bounded(
+    path: str | Path,
+    include_beats: bool = False,
+    key_profile: str = key_mod.DEFAULT_PROFILE,
+    on_progress: ProgressFn | None = None,
+    token: object | None = None,
+    timeout: float = ANALYSIS_TIMEOUT_SECONDS,
+) -> dict:
+    """Measure a file's tempo, key and loudness in a child process.
+
+    The measurements themselves are numpy, scipy and librosa calls, and a
+    native call that stalls inside this process cannot be timed out,
+    cancelled or killed — it holds the only worker there is until the
+    application is closed. That is not hypothetical: a real import stopped
+    inside the loudness measurement and stayed there, at 96%, with a stage
+    that had reported once and never again.
+
+    Run as a child, the same work can be bounded, watched for having gone
+    quiet, and killed. It is also the last thing a job does, so paying a
+    process start for it costs nothing anybody notices.
+
+    Returns the same payload :meth:`TrackAnalysis.to_dict` produces, which
+    is what every caller wants: the nested estimate objects exist to build
+    it and are not worth reconstructing on this side of a pipe.
+
+    Falls back to measuring in process if the child cannot be started at
+    all — an analysis that runs is better than one that does not, and the
+    caller already treats a failed analysis as non-fatal.
+    """
+    from ..audio_io import run_bounded
+
+    source = Path(path)
+    command = [
+        sys.executable,
+        "-m",
+        "sipra_core",
+        "analyze",
+        str(source),
+        "--key-profile",
+        key_profile,
+    ]
+    if include_beats:
+        command.append("--beats")
+
+    def relay(line: str) -> None:
+        match = _PROGRESS_LINE.match(line)
+        if not match or on_progress is None:
+            return
+        try:
+            on_progress(match.group(1), min(1.0, float(match.group(2)) / 100.0))
+        except Exception:  # pragma: no cover - progress must never fail a job
+            pass
+
+    # The child imports this package by name, and cannot be assumed to
+    # inherit a working directory that makes that possible — under a test
+    # runner it does not. Handing it the parent's own import path removes
+    # the assumption rather than relying on it.
+    package_root = str(Path(__file__).resolve().parent.parent.parent)
+    child_env = dict(os.environ)
+    existing = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = (
+        package_root + os.pathsep + existing if existing else package_root
+    )
+
+    trace("analysing in a child process", file=source.name)
+    try:
+        payload, _stderr = run_bounded(
+            command,
+            expected_bytes=0,
+            timeout=timeout,
+            on_progress=None,
+            token=token,  # type: ignore[arg-type]
+            label="analysis",
+            on_stderr_line=relay,
+            env=child_env,
+        )
+    except FileNotFoundError:  # pragma: no cover - no interpreter to re-run
+        trace("could not start an analysis child, measuring in process")
+        return analyse_file(
+            source,
+            include_beats=include_beats,
+            key_profile=key_profile,
+            on_progress=on_progress,
+        ).to_dict(include_beats=include_beats)
+
+    try:
+        parsed = json.loads(payload.decode("utf-8", "replace"))
+        if not isinstance(parsed, dict):
+            raise ValueError("expected an object")
+        return parsed
+    except Exception as exc:
+        raise SipraError(
+            ErrorCode.INTERNAL,
+            f"Analysis produced output that could not be read: {exc}",
+            {"path": str(source)},
+        ) from exc

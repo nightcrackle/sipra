@@ -427,7 +427,7 @@ def _load_with_ffmpeg(
     duration = meta.get("duration") or 0.0
     expected = int(duration * sr * channels * 4) if duration > 0 else 0
 
-    payload, stderr = _run_streaming(
+    payload, stderr = run_bounded(
         cmd,
         expected_bytes=expected,
         timeout=DECODE_TIMEOUT_SECONDS,
@@ -449,13 +449,15 @@ def _load_with_ffmpeg(
     return np.ascontiguousarray(interleaved.T.astype(np.float32)), sr
 
 
-def _run_streaming(
+def run_bounded(
     cmd: list[str],
     expected_bytes: int,
     timeout: float,
     on_progress: Callable[[float], None] | None,
     token: Cancellable | None,
     label: str,
+    on_stderr_line: Callable[[str], None] | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[bytes, str]:
     """Run a command, reading stdout in chunks against a deadline.
 
@@ -481,6 +483,7 @@ def _run_streaming(
         stderr=subprocess.PIPE,
         # Never inherit the sidecar's stdin; see ingest/youtube.py.
         stdin=subprocess.DEVNULL,
+        env=env,
         creationflags=_creation_flags(),
     )
 
@@ -494,6 +497,11 @@ def _run_streaming(
                 errors.append(line)
                 if len(errors) > 200:
                     del errors[:100]
+                if on_stderr_line is not None:
+                    try:
+                        on_stderr_line(line.decode("utf-8", "replace").rstrip())
+                    except Exception:  # pragma: no cover - never fail on a report
+                        pass
         except Exception:  # pragma: no cover - stream closed under us
             pass
 

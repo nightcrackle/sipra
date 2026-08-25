@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .analysis import analyse_buffer
+from .analysis import analyse_buffer, analyse_file_bounded
 from .audio_io import AudioBuffer, load_audio, write_audio
 from .engines.base import CancellationToken, SeparationRequest
 from .engines.registry import EngineRegistry
@@ -373,15 +373,30 @@ def separate_track(
         trace_memory("memory before analysis")
         _log_stage("measuring tempo, key and loudness")
         try:
-            analysis = analyse_buffer(
-                AudioBuffer(data=source.data, sample_rate=out_rate),
-                on_progress=lambda _s, f: progress.report("analyse", f),
-                # The slowest stage on a cold machine, and the one a user is
-                # most likely to give up on. It used to ignore them.
-                token=token,
-            )
-            analysis_payload = analysis.to_dict()
-            warnings.extend(analysis.warnings)
+            # Measured in a child process where there is a file to measure.
+            #
+            # These are numpy, scipy and librosa calls, and a native call
+            # that stalls inside this process cannot be timed out,
+            # cancelled or killed. A real job stopped inside the loudness
+            # measurement and stayed at 96% — a stage that had reported
+            # once and never again, with nothing able to end it. Run as a
+            # child, the same work is bounded and killable, and this is the
+            # last thing the job does, so a process start costs nothing.
+            if keep_source_copy and source_path.exists():
+                analysis_payload = analyse_file_bounded(
+                    source_path,
+                    on_progress=lambda _s, f: progress.report("analyse", f),
+                    token=token,
+                )
+                warnings.extend(analysis_payload.get("warnings", []))
+            else:
+                analysis = analyse_buffer(
+                    AudioBuffer(data=source.data, sample_rate=out_rate),
+                    on_progress=lambda _s, f: progress.report("analyse", f),
+                    token=token,
+                )
+                analysis_payload = analysis.to_dict()
+                warnings.extend(analysis.warnings)
             _log_stage("analysis finished")
         except CancelledError:
             # A cancel is not an analysis failure to be noted and moved

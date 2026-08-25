@@ -189,7 +189,7 @@ class TestStallDetection:
         )
         monkeypatch.setattr(audio_io, "DECODE_STALL_SECONDS", 1)
         with pytest.raises(SipraError) as info:
-            audio_io._run_streaming(
+            audio_io.run_bounded(
                 [sys.executable, str(script)],
                 expected_bytes=1_000_000,
                 timeout=600.0,
@@ -217,7 +217,7 @@ class TestStallDetection:
             )
         )
         monkeypatch.setattr(audio_io, "DECODE_STALL_SECONDS", 2)
-        payload, _stderr = audio_io._run_streaming(
+        payload, _stderr = audio_io.run_bounded(
             [sys.executable, str(script)],
             expected_bytes=24,
             timeout=60.0,

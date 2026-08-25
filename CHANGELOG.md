@@ -12,6 +12,61 @@ real hardware.
 
 ---
 
+## [0.9.15] — 2026-08-25
+
+The decode fix in 0.9.14 worked: the import now gets past 32% and through
+separation. It stalls at 96% instead — the same fault, one stage later,
+and now the last one that could still do this.
+
+The log narrows it to a single call. `analyse 96%` is the loudness
+measurement having reported that it was starting; the next report, at 97%,
+never arrives. Analysis is numpy, scipy and librosa, running inside the
+sidecar, and a native call that stalls there cannot be timed out,
+cancelled or killed. The cancellation checks added in 0.9.14 sit *between*
+measurements, so they were never reached.
+
+### Changed
+
+- **Analysis runs in a child process.** Bounded, watched for having gone
+  quiet, and killable — the same treatment decoding got in 0.9.14, for the
+  same reason and against the same evidence. It is the last thing a job
+  does, so the process start costs nothing anybody notices. It reuses the
+  `analyze` command that already existed for debugging from a terminal.
+
+  With this, every stage that touches native code — decode, separation,
+  analysis — either runs in a child process or reports progress often
+  enough that a stall is caught. There is no longer a step that can stop
+  the engine dead.
+
+- **The analysis child is given the parent's import path** rather than
+  relying on the working directory. Found by the tests: under a runner the
+  import path comes from the runner, not the directory, and a child that
+  assumed otherwise failed instantly. Any caller working from a different
+  directory would have hit the same thing.
+
+### Added
+
+- `--key-profile` on the `analyze` command, which the API had and the
+  command line did not.
+
+### Tests
+
+- 644 TypeScript tests, 586 Python tests.
+- The child's measurements are pinned against the in-process ones —
+  loudness, key, duration — so moving the work cannot move the numbers.
+- Progress relayed out of the child, a deadline that fires, cancellation
+  that stops it, and a run from an unrelated working directory.
+
+### On the shape of these three releases
+
+0.9.13 fixed a killed process being able to mark its replacement dead.
+0.9.14 moved decoding out of process. This moves analysis. All three are
+the same lesson arriving in instalments: work that cannot be interrupted
+does not belong on the thread that everything else waits behind. That was
+worth stating once, at the start, rather than three times in a row.
+
+---
+
 ## [0.9.14] — 2026-08-25
 
 `unchangedForMs: 464769` — eight minutes on one line, and the line that

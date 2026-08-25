@@ -405,7 +405,7 @@ class TestDecodeDeadlines:
             )
         )
         with pytest.raises(SipraError) as info:
-            audio_io._run_streaming(
+            audio_io.run_bounded(
                 [sys.executable, str(script)],
                 expected_bytes=0,
                 timeout=1.0,
@@ -440,7 +440,7 @@ class TestDecodeDeadlines:
                 """
             )
         )
-        payload, stderr = audio_io._run_streaming(
+        payload, stderr = audio_io.run_bounded(
             [sys.executable, str(script)],
             expected_bytes=64,
             timeout=30.0,
@@ -466,7 +466,7 @@ class TestDecodeDeadlines:
             )
         )
         with pytest.raises(SipraError) as info:
-            audio_io._run_streaming(
+            audio_io.run_bounded(
                 [sys.executable, str(script)],
                 expected_bytes=0,
                 timeout=30.0,
@@ -494,7 +494,7 @@ class TestDecodeDeadlines:
             cancelled = True
 
         with pytest.raises(CancelledError):
-            audio_io._run_streaming(
+            audio_io.run_bounded(
                 [sys.executable, str(script)],
                 expected_bytes=0,
                 timeout=60.0,

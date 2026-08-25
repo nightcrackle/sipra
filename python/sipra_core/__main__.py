@@ -65,7 +65,10 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"  {stage:<10} {fraction * 100:5.1f}%", file=sys.stderr)
 
-    analysis = analyse_file(args.path, include_beats=args.beats, on_progress=report)
+    kwargs = {"key_profile": args.key_profile} if getattr(args, "key_profile", None) else {}
+    analysis = analyse_file(
+        args.path, include_beats=args.beats, on_progress=report, **kwargs
+    )
     print(json.dumps(analysis.to_dict(include_beats=args.beats), indent=2))
     return 0
 
@@ -134,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser("analyze", help="Measure BPM, key and loudness")
     analyze.add_argument("path")
     analyze.add_argument("--beats", action="store_true", help="Include the beat grid")
+    analyze.add_argument(
+        "--key-profile",
+        default=None,
+        help="Key-detection profile (default: temperley)",
+    )
     analyze.add_argument("-q", "--quiet", action="store_true")
     analyze.set_defaults(func=_cmd_analyze)
 
