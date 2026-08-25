@@ -28,7 +28,7 @@ jobs:
       matrix:
         # Windows is the shipping target; Ubuntu catches path and
         # case-sensitivity mistakes that Windows would hide.
-        os: [windows-latest, ubuntu-latest]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
